@@ -15,8 +15,10 @@ target file only after the servers come up):
      - Dynamo arm: the single target is the FRONTEND → exposes dynamo_frontend_*.
   2. Dynamo worker /metrics endpoints recorded by dynamo_async_server when
      enable_worker_system_metrics=true (one file per replica/node, *.endpoints).
-     These expose the engine-level vllm:prefix_cache_* that makes the Dynamo arm
-     directly comparable to the vLLM arm.
+     On engine=vllm these expose the engine-level vllm:prefix_cache_* that makes
+     the Dynamo arm directly comparable to the vLLM arm. On engine=sglang there
+     are no vllm: families; only the portable dynamo_component_* gauges below,
+     which is what a Dynamo-sglang arm can be compared on.
 
 Stdlib only: urllib, json, re, glob, time, datetime, argparse, pathlib.
 
@@ -42,9 +44,9 @@ METRIC_LINE_RE = re.compile(r"([^\s{]+)(?:\{[^}]*\})?\s+([-+0-9.eE]+)")
 
 # Metric families worth persisting. Engine-level vllm:prefix_cache_* is the
 # apples-to-apples cross-backend KV hit-rate signal (present on vLLM workers AND
-# on Dynamo workers via the system port).
+# on Dynamo workers via the system port, as long as those workers run vllm).
 METRIC_NAMES = {
-    # vLLM engine (vLLM arm workers + Dynamo arm workers)
+    # vLLM engine (vLLM arm workers + Dynamo arm workers on engine=vllm)
     "vllm:prefix_cache_queries_total",
     "vllm:prefix_cache_hits_total",
     "vllm:kv_cache_usage_perc",

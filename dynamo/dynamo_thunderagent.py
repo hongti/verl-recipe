@@ -95,13 +95,13 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         self,
         served_model_name: str,
         tp: int,
-        kv_events_config_json: str,
+        kv_events_config_json: Optional[str] = None,
     ) -> list[str]:
         thunderagent_enabled = self._thunderagent_enabled()
         worker_model_name = (
             f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}" if thunderagent_enabled else served_model_name
         )
-        command = super()._build_vllm_cmd(worker_model_name, tp, kv_events_config_json)
+        command = super()._build_vllm_cmd(worker_model_name, tp, kv_events_config_json=kv_events_config_json)
         if not thunderagent_enabled:
             return command
 
@@ -119,6 +119,33 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if configured_block_size is None:
             command.extend(["--block-size", block_size])
         return command
+
+    def _build_sglang_cmd(self, served_model_name: str, tp: int, nccl_port=None, **kwargs) -> list[str]:
+        """TA worker-side glue for the sglang engine, mirroring _build_vllm_cmd.
+
+        Extra keyword arguments (kv_events_config_json, ...) belong to the base builder and
+        pass through untouched.
+
+        Rename the worker's served model so the frontend cannot route requests
+        (or session-final probes) directly to it — with ThunderAgent on, the
+        ONLY handler advertising the public model name must be the TA router,
+        otherwise generation silently bypasses program affinity. Page-size
+        alignment is handled by the base builder (it falls back to
+        thunderagent.router_block_size); an explicit sglang.page_size that
+        contradicts the router block size fails fast here, same as the vLLM
+        --block-size check.
+        """
+        if not self._thunderagent_enabled():
+            return super()._build_sglang_cmd(served_model_name, tp, nccl_port=nccl_port, **kwargs)
+        explicit_page_size = self._sglang_cfg().get("page_size")
+        router_block_size = self._thunderagent_router_block_size()
+        if explicit_page_size is not None and int(explicit_page_size) != int(router_block_size):
+            raise ValueError(
+                "Dynamo sglang and ThunderAgent router block sizes must match: "
+                f"sglang.page_size={explicit_page_size} != thunderagent.router_block_size={router_block_size}"
+            )
+        worker_model_name = f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}"
+        return super()._build_sglang_cmd(worker_model_name, tp, nccl_port=nccl_port, **kwargs)
 
     def _frontend_router_args(self) -> list[str]:
         args = super()._frontend_router_args()
@@ -156,10 +183,16 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             raise RuntimeError(f"dynamo ThunderAgent exited rc={process.returncode}")
 
     def _frontend_headers(self, request_id: str) -> dict[str, str]:
-        headers = {"X-Request-Id": str(request_id)}
+        # Build on the base headers: register.py always serves through this class, so
+        # the base router_session_affinity_ttl_secs header (x-dynamo-session-id keyed on
+        # the trajectory request id) would otherwise never reach the wire. An active
+        # ThunderAgent program overrides it -- same header, which the frontend matches
+        # case-insensitively, so drop the base spelling before adding TA's.
+        headers = super()._frontend_headers(request_id)
         request_program = _REQUEST_PROGRAM.get()
         if request_program is not None:
             session_id, is_final = request_program
+            headers.pop("x-dynamo-session-id", None)
             headers["X-Dynamo-Session-ID"] = session_id
             if is_final:
                 headers["X-Dynamo-Session-Final"] = "true"
@@ -173,23 +206,10 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         nvext = payload.setdefault("nvext", {})
         if not isinstance(nvext, dict):
             raise TypeError("Dynamo nvext must be a mapping")
-        # PR #110 launches one DP=1 vLLM process per shard. Supplying its rank
+        # The launcher runs one DP=1 engine process per shard (both engines). Supplying its rank
         # avoids a startup race when ThunderAgent pins a newly discovered worker.
         nvext.setdefault("dp_rank", 0)
         return payload
-
-    async def _frontend_post(self, payload: dict[str, Any], request_id: str) -> tuple[int, str]:
-        import aiohttp
-
-        session = await self._get_http_session()
-        timeout = aiohttp.ClientTimeout(total=self._frontend_request_timeout_s())
-        async with session.post(
-            self._frontend_completions_url(),
-            json=payload,
-            headers=self._frontend_headers(request_id),
-            timeout=timeout,
-        ) as response:
-            return response.status, await response.text()
 
     async def generate(self, *args, thunderagent_session_id: Optional[str] = None, **kwargs):
         if not self._thunderagent_enabled():

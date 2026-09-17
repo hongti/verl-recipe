@@ -21,7 +21,7 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 METRICS_DIR=${METRICS_DIR:-"${RAY_DATA_HOME}/logs/${exp_name}"}
 METRICS_PORT=${METRICS_PORT:-9200}
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 export VERL_DYNAMO_WORKER_METRICS_DIR="${METRICS_DIR}/workers"
 mkdir -p "${VERL_DYNAMO_WORKER_METRICS_DIR}"
 
@@ -33,7 +33,10 @@ python3 recipe/dynamo/metrics_sidecar.py \
 sidecar_pid=$!
 trap 'kill "${sidecar_pid}" 2>/dev/null || true' EXIT
 
-python3 -m recipe.dynamo.main_dynamo \
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
@@ -47,8 +50,8 @@ python3 -m recipe.dynamo.main_dynamo \
     data.truncation=error \
     data.custom_cls.path=recipe/retool/retool.py \
     data.custom_cls.name=CustomRLHFDataset \
-    custom_reward_function.path=recipe/retool/retool.py \
-    custom_reward_function.name=compute_score \
+    reward.custom_reward_function.path=recipe/retool/retool.py \
+    reward.custom_reward_function.name=compute_score \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \

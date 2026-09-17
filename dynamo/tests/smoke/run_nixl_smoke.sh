@@ -2,8 +2,8 @@
 # NIXL refit smoke for the dynamo rollout backend — real training steps so
 # update_weights exercises the CheckpointEngineWorker chain each step.
 # Run from a verl checkout containing this repository at recipe/.
-#   NNODES=1 NGPUS_PER_NODE=8 bash recipe/dynamo/run_nixl_smoke.sh   # single-node
-#   NNODES=2 NGPUS_PER_NODE=8 bash recipe/dynamo/run_nixl_smoke.sh   # multi-node
+#   NNODES=1 NGPUS_PER_NODE=8 bash recipe/dynamo/tests/smoke/run_nixl_smoke.sh   # single-node
+#   NNODES=2 NGPUS_PER_NODE=8 bash recipe/dynamo/tests/smoke/run_nixl_smoke.sh   # multi-node
 set -xuo pipefail
 
 NNODES=${NNODES:-1}
@@ -16,12 +16,15 @@ TEST_FILE=${TEST_FILE:-/workspace/data_aime/data/aime-2024.parquet}
 BUCKET_MB=${BUCKET_MB:-1024}
 EXP_NAME=${EXP_NAME:-nixl-smoke-${CE_BACKEND}-n${NNODES}}
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 export HYDRA_FULL_ERROR=1
 
 cd /workspace/verl
 
-python3 -m recipe.dynamo.main_dynamo \
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
