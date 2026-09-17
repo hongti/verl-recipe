@@ -1,0 +1,999 @@
+diff --git a/verl/checkpoint_engine/base.py b/verl/checkpoint_engine/base.py
+index 73608f20..3cfb0567 100644
+--- a/verl/checkpoint_engine/base.py
++++ b/verl/checkpoint_engine/base.py
+@@ -320,9 +320,9 @@ class CheckpointEngineWorker(Worker):
+         initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+-    async def update_weights(self, global_steps: int = None):
++    async def update_weights(self, global_steps: int = None, eplb_strategy: dict = None):
+         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+-        await self.server_adapter.update_weights(weights, global_steps=global_steps)
++        await self.server_adapter.update_weights(weights, global_steps=global_steps, eplb_strategy=eplb_strategy)
+ 
+     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
+     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+@@ -467,7 +467,7 @@ class CheckpointEngineManager:
+         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
+ 
+     @auto_await
+-    async def update_weights(self, global_steps: int = None):
++    async def update_weights(self, global_steps: int = None, eplb_strategy: dict = None):
+         """Update weights from trainer to rollout replicas.
+ 
+         Args:
+@@ -476,7 +476,13 @@ class CheckpointEngineManager:
+ 
+         # 0. update weights for sync training with colocated trainer and rollout
+         if self.backend == "naive":
+-            ray.get(self.trainer.update_weights(global_steps=global_steps, mode=self.backend))
++            ray.get(
++                self.trainer.update_weights(
++                    global_steps=global_steps,
++                    mode=self.backend,
++                    eplb_strategy=eplb_strategy,
++                )
++            )
+             return
+ 
+         # 1. abort and save all unfinished requests for partial rollout
+@@ -498,7 +504,7 @@ class CheckpointEngineManager:
+         # 5. update weights of all workers
+         ray.get(
+             trainer.update_weights(global_steps=global_steps, mode=self.backend)
+-            + rollout.update_weights(global_steps=global_steps)
++            + rollout.update_weights(global_steps=global_steps, eplb_strategy=eplb_strategy)
+         )
+ 
+         # 6. finalize all workers
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index 588cc8ec..de7c63cd 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -160,6 +160,9 @@ actor_rollout_ref:
+       mode: disabled
+       record_file: null
+       replay_file: null
++    train_eplb_strategy_path: ''
++    eplb_mode: Static
++    eplb_enable: false
+     qat:
+       enable: false
+       mode: w4a16
+@@ -349,6 +352,8 @@ actor_rollout_ref:
+       max_samples_per_step_per_worker: null
+     skip_tokenizer_init: true
+     enable_rollout_routing_replay: false
++    rollout_eplb_strategy_path: ''
++    eplb_strategy_file_path: null
+     profiler:
+       _target_: verl.utils.profiler.ProfilerConfig
+       tool: ${oc.select:global_profiler.tool,null}
+@@ -884,6 +889,10 @@ trainer:
+   validation_data_dir: null
+   nnodes: 1
+   n_gpus_per_node: 8
++  eplb_update_interval: 20
++  eplb_load_collection_enable: false
++  eplb_load_collection_steps: 100
++  eplb_load_output_path: ''
+   save_freq: -1
+   esi_redundant_time: 0
+   resume_mode: auto
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index d4452207..4854d7eb 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -129,6 +129,9 @@ actor_rollout_ref:
+       mode: disabled
+       record_file: null
+       replay_file: null
++    train_eplb_strategy_path: ''
++    eplb_mode: Static
++    eplb_enable: false
+     qat:
+       enable: false
+       mode: w4a16
+@@ -315,6 +318,8 @@ actor_rollout_ref:
+       max_samples_per_step_per_worker: null
+     skip_tokenizer_init: true
+     enable_rollout_routing_replay: false
++    rollout_eplb_strategy_path: ''
++    eplb_strategy_file_path: null
+     profiler:
+       _target_: verl.utils.profiler.ProfilerConfig
+       tool: ${oc.select:global_profiler.tool,null}
+@@ -818,6 +823,10 @@ trainer:
+   validation_data_dir: null
+   nnodes: 1
+   n_gpus_per_node: 8
++  eplb_update_interval: 20
++  eplb_load_collection_enable: false
++  eplb_load_collection_steps: 100
++  eplb_load_output_path: ''
+   save_freq: -1
+   esi_redundant_time: 0
+   resume_mode: auto
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index 53caff02..860c15ff 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -138,6 +138,9 @@ actor_rollout_ref:
+       mode: disabled
+       record_file: null
+       replay_file: null
++    train_eplb_strategy_path: ''
++    eplb_mode: Static
++    eplb_enable: false
+     qat:
+       enable: false
+       mode: w4a16
+@@ -322,6 +325,8 @@ actor_rollout_ref:
+       max_samples_per_step_per_worker: null
+     skip_tokenizer_init: true
+     enable_rollout_routing_replay: false
++    rollout_eplb_strategy_path: ''
++    eplb_strategy_file_path: null
+     profiler:
+       _target_: verl.utils.profiler.ProfilerConfig
+       tool: ${oc.select:global_profiler.tool,null}
+@@ -838,6 +843,10 @@ trainer:
+   validation_data_dir: null
+   nnodes: 1
+   n_gpus_per_node: 8
++  eplb_update_interval: 20
++  eplb_load_collection_enable: false
++  eplb_load_collection_steps: 100
++  eplb_load_output_path: ''
+   save_freq: -1
+   esi_redundant_time: 0
+   resume_mode: auto
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index bb202e92..95f87d50 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -136,6 +136,9 @@ actor_rollout_ref:
+       mode: disabled
+       record_file: null
+       replay_file: null
++    train_eplb_strategy_path: ''
++    eplb_mode: Static
++    eplb_enable: false
+     qat:
+       enable: false
+       mode: w4a16
+@@ -313,6 +316,8 @@ actor_rollout_ref:
+       max_samples_per_step_per_worker: null
+     skip_tokenizer_init: true
+     enable_rollout_routing_replay: false
++    rollout_eplb_strategy_path: ''
++    eplb_strategy_file_path: null
+     profiler:
+       _target_: verl.utils.profiler.ProfilerConfig
+       tool: ${oc.select:global_profiler.tool,null}
+@@ -823,6 +828,10 @@ trainer:
+   validation_data_dir: null
+   nnodes: 1
+   n_gpus_per_node: 8
++  eplb_update_interval: 20
++  eplb_load_collection_enable: false
++  eplb_load_collection_steps: 100
++  eplb_load_output_path: ''
+   save_freq: -1
+   esi_redundant_time: 0
+   resume_mode: auto
+diff --git a/verl/trainer/config/actor/actor.yaml b/verl/trainer/config/actor/actor.yaml
+index 11547d8f..138c169f 100644
+--- a/verl/trainer/config/actor/actor.yaml
++++ b/verl/trainer/config/actor/actor.yaml
+@@ -279,6 +279,15 @@ router_replay:
+   # Required when mode is 'replay'
+   replay_file: null
+ 
++# File path for static or initial dynamic EPLB training placement strategy
++train_eplb_strategy_path: ""
++
++# Expert relocation mode. Supported values: Static, Dynamic
++eplb_mode: Static
++
++# Whether to enable EPLB expert placement on actor training workers
++eplb_enable: false
++
+ # QAT (Quantization-Aware Training) configuration
+ # When enabled:
+ #   - QAT is automatically applied to actor model during training
+@@ -310,4 +319,3 @@ qat:
+ 
+   # Path to vLLM quantization config JSON file
+   quantization_config_path: null
+-
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index d8030490..e5995060 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -145,6 +145,18 @@ trainer:
+   # Number of GPUs per node
+   n_gpus_per_node: 8
+ 
++  # Number of collected rollout load snapshots before updating EPLB strategy
++  eplb_update_interval: 20
++
++  # Whether to collect rollout expert load for offline EPLB strategy generation
++  eplb_load_collection_enable: false
++
++  # Number of collected rollout load snapshots before exporting static load data
++  eplb_load_collection_steps: 100
++
++  # Output path for static EPLB load collection
++  eplb_load_output_path: ""
++
+   # Save frequency (by iteration) for model checkpoints
+   save_freq: -1
+ 
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index 27bf5907..9f4c2a57 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -324,6 +324,12 @@ skip_tokenizer_init: True
+ # When enabled (True), the rollout will record the routing decisions.
+ enable_rollout_routing_replay: False
+ 
++# File path for rollout inference EPLB placement strategy
++rollout_eplb_strategy_path: ""
++
++# File path for dynamic EPLB strategy generation function
++eplb_strategy_file_path: null
++
+ 
+ # profile the rollout model in `generate_sequence`
+ profiler:
+diff --git a/verl/utils/megatron/router_replay_patch.py b/verl/utils/megatron/router_replay_patch.py
+index 97d49528..5b4ed4b2 100644
+--- a/verl/utils/megatron/router_replay_patch.py
++++ b/verl/utils/megatron/router_replay_patch.py
+@@ -140,6 +140,7 @@ def _patched_topk_routing_with_score_function(
+     fused: bool,
+     router_replay: RouterReplay,
+     scaling_factor: float,
++    send_map: torch.Tensor = None,
+ ):
+     """
+     Patched version of topk_routing_with_score_function that supports router replay.
+@@ -222,6 +223,9 @@ def _patched_topk_routing_with_score_function(
+     if scaling_factor:
+         probs = probs * scaling_factor
+ 
++    if send_map is not None:
++        top_indices = send_map.to(top_indices.device)[top_indices]
++
+     if torch.are_deterministic_algorithms_enabled():
+         # build [num_tokens, num_experts] from [num_tokens, topk]
+         routing_probs = torch.zeros_like(logits)
+@@ -300,6 +304,7 @@ def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
+             expert_bias=self.expert_bias,
+             fused=moe_router_fusion,
+             router_replay=getattr(self, "router_replay", None),
++            send_map=getattr(self, "send_map", None),
+         )
+ 
+     # Apply token dropping to probs and routing_map.
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 12dad69f..590f56f1 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -43,6 +43,7 @@ import verl.utils.megatron.tensor_parallel as tp_utils
+ from verl.utils import tensordict_utils as tu
+ from verl.utils.device import get_device_id, get_device_name, get_torch_device
+ from verl.utils.fs import local_mkdir_safe
++from verl.utils.moe_eplb import load_strategy_from_path, strategy_to_placement
+ from verl.utils.model import normalize_model_name
+ from verl.utils.torch_dtypes import PrecisionType
+ from verl.workers.config import HFModelConfig, McoreEngineConfig
+@@ -1539,6 +1540,20 @@ def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
+                 config.param_sync_func = config.param_sync_func[0]
+ 
+ 
++def get_placement(config, new_strategy=None):
++    if new_strategy is not None:
++        strategy = new_strategy
++    else:
++        strategy = load_strategy_from_path(getattr(config, "train_eplb_strategy_path", ""))
++        if strategy is None:
++            raise ValueError("train_eplb_strategy_path must be set when expert relocation strategy is not provided")
++
++    num_experts = getattr(config, "num_moe_experts", None)
++    if num_experts is None:
++        num_experts = getattr(config, "num_experts", None)
++    return strategy_to_placement(strategy, num_experts=num_experts)
++
++
+ def mapping_string_to_attn_backend(args: dict) -> dict:
+     if "attention_backend" in args and isinstance(args["attention_backend"], str):
+         from megatron.core.transformer.enums import AttnBackend
+diff --git a/verl/utils/moe_eplb.py b/verl/utils/moe_eplb.py
+new file mode 100644
+index 00000000..9282c4c3
+--- /dev/null
++++ b/verl/utils/moe_eplb.py
+@@ -0,0 +1,106 @@
++import json
++import logging
++import os
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++EMPTY_PATH_VALUES = {"", "None", "none", "null"}
++
++
++def _to_int(value: Any, name: str) -> int:
++    try:
++        return int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
++
++
++def load_strategy_from_path(strategy_path: Optional[str]) -> Optional[dict[str, Any]]:
++    if strategy_path is None:
++        return None
++    strategy_path = str(strategy_path).strip()
++    if strategy_path in EMPTY_PATH_VALUES:
++        return None
++    with open(strategy_path, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def _normalize_layer(layer: dict[str, Any]) -> tuple[int, dict[int, list[int]]]:
++    if not isinstance(layer, dict):
++        raise ValueError(f"layer entry must be a dict, got {type(layer).__name__}")
++    layer_id = _to_int(layer.get("layer_id"), "layer_id")
++    device_list = layer.get("device_list")
++    if not isinstance(device_list, list):
++        raise ValueError(f"layer {layer_id} device_list must be a list")
++
++    devices = {}
++    for device in device_list:
++        if not isinstance(device, dict):
++            raise ValueError(f"layer {layer_id} device entry must be a dict")
++        device_id = _to_int(device.get("device_id"), "device_id")
++        experts = device.get("device_expert")
++        if not isinstance(experts, list):
++            raise ValueError(f"layer {layer_id}, device {device_id} device_expert must be a list")
++        if device_id in devices:
++            raise ValueError(f"layer {layer_id} has duplicate device id {device_id}")
++        devices[device_id] = [_to_int(expert, "expert_id") for expert in experts]
++    return layer_id, devices
++
++
++def validate_eplb_strategy(
++    strategy: dict[str, Any],
++    *,
++    num_experts: Optional[int] = None,
++    device_count: Optional[int] = None,
++) -> dict[int, dict[int, list[int]]]:
++    if not isinstance(strategy, dict):
++        raise ValueError("strategy must be a dict")
++
++    layer_list = strategy.get("layer_list")
++    if not isinstance(layer_list, list):
++        raise ValueError("strategy layer_list must be a list")
++
++    moe_layer_count = _to_int(strategy.get("moe_layer_count", len(layer_list)), "moe_layer_count")
++    if moe_layer_count != len(layer_list):
++        raise ValueError(
++            f"moe_layer_count ({moe_layer_count}) must match layer_list length ({len(layer_list)})"
++        )
++
++    normalized: dict[int, dict[int, list[int]]] = {}
++    for layer in layer_list:
++        layer_id, devices = _normalize_layer(layer)
++        if layer_id in normalized:
++            raise ValueError(f"duplicate layer_id {layer_id}")
++        if device_count is not None:
++            expected_devices = list(range(device_count))
++            actual_devices = sorted(devices)
++            if actual_devices != expected_devices:
++                raise ValueError(
++                    f"layer {layer_id} device count or ids mismatch: expected {expected_devices}, got {actual_devices}"
++                )
++
++        flattened = [expert for experts in devices.values() for expert in experts]
++        if num_experts is not None:
++            expected_experts = list(range(num_experts))
++            if sorted(flattened) != expected_experts:
++                raise ValueError(
++                    f"layer {layer_id} must contain every expert id in [0, {num_experts}) exactly once"
++                )
++        elif len(flattened) != len(set(flattened)):
++            raise ValueError(f"layer {layer_id} must not contain duplicate expert ids")
++
++        normalized[layer_id] = devices
++    return normalized
++
++
++def strategy_to_placement(
++    strategy: dict[str, Any],
++    *,
++    num_experts: Optional[int] = None,
++    device_count: Optional[int] = None,
++) -> dict[int, dict[int, list[int]]]:
++    normalized = validate_eplb_strategy(strategy, num_experts=num_experts, device_count=device_count)
++    return {
++        layer_id: {device_id: list(experts) for device_id, experts in sorted(devices.items())}
++        for layer_id, devices in sorted(normalized.items())
++    }
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index f52c3888..318e26c2 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -185,6 +185,9 @@ class ActorConfig(BaseConfig):
+     rollout_n: int = MISSING  # must be override by sampling config
+     model_config: HFModelConfig = field(default_factory=BaseConfig)
+     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
++    train_eplb_strategy_path: str = ""
++    eplb_mode: str = "Static"
++    eplb_enable: bool = False
+ 
+     # Store global batch info for loss aggregation:
+     # dp_size: data parallel size
+@@ -218,6 +221,8 @@ class ActorConfig(BaseConfig):
+         ]
+         if self.loss_agg_mode not in valid_loss_agg_modes:
+             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
++        if self.eplb_mode not in ["Static", "Dynamic"]:
++            raise ValueError("eplb_mode must be either 'Static' or 'Dynamic'.")
+ 
+     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+         """Validate actor configuration with runtime parameters."""
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index b5ad8e9c..014b757f 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -85,6 +85,9 @@ class EngineConfig(BaseConfig):
+         "use_remove_padding",
+         "forward_only",
+         "param_offload",
++        "train_eplb_strategy_path",
++        "eplb_mode",
++        "eplb_enable",
+     }
+     # whether to offload param
+     param_offload: bool = False
+@@ -115,6 +118,9 @@ class EngineConfig(BaseConfig):
+ 
+     full_determinism: bool = False
+     router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
++    train_eplb_strategy_path: str = ""
++    eplb_mode: str = "Static"
++    eplb_enable: bool = False
+ 
+     def __post_init__(self):
+         pass
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index 9ccfb568..ecb46866 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -252,6 +252,10 @@ class RolloutConfig(BaseConfig):
+ 
+     enable_rollout_routing_replay: bool = False
+ 
++    rollout_eplb_strategy_path: str = ""
++
++    eplb_strategy_file_path: Optional[str] = None
++
+     enable_sleep_mode: bool = True
+ 
+     mtp: MtpConfig = field(default_factory=MtpConfig)
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 918d85ef..e8a27684 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -53,6 +53,7 @@ from verl.utils.megatron_utils import (
+     check_mtp_config,
+     get_megatron_module_device,
+     get_megatron_mtp_loss,
++    get_placement,
+     load_megatron_model_to_gpu,
+     load_megatron_optimizer,
+     offload_megatron_model_to_cpu,
+@@ -97,6 +98,7 @@ class MegatronEngine(BaseEngine):
+         self._is_offload_optimizer = self.engine_config.optimizer_offload
+ 
+         self.mode = None
++        self._pending_eplb_strategy = None
+ 
+         self.layer_name_mapping = {
+             "qkv_layer_name": "self_attention.linear_qkv.",
+@@ -253,6 +255,7 @@ class MegatronEngine(BaseEngine):
+             if tf_config is not None:
+                 print(f"TF config: {tf_config}")
+         self.tf_config = tf_config
++        self._apply_expert_relocation_config()
+ 
+         from verl.workers.config.megatron_peft import get_peft_cls
+ 
+@@ -291,6 +294,7 @@ class MegatronEngine(BaseEngine):
+             peft_config=self.model_config.get("lora", None),
+         )
+         self.tf_config = updated_tf_config
++        self._apply_expert_relocation_config()
+         print(f"module: {len(module)}")
+ 
+         if self.engine_config.use_dist_checkpointing:
+@@ -316,6 +320,79 @@ class MegatronEngine(BaseEngine):
+ 
+         return module
+ 
++    def _apply_expert_relocation_config(self):
++        if self.tf_config is None:
++            return
++        for field in (
++            "train_eplb_strategy_path",
++            "eplb_mode",
++            "eplb_enable",
++        ):
++            if hasattr(self.engine_config, field):
++                setattr(self.tf_config, field, getattr(self.engine_config, field))
++        eplb_enable = bool(getattr(self.engine_config, "eplb_enable", False))
++        self.tf_config.enable_external_expert_placement = eplb_enable
++
++    def _do_expert_weight_and_optimizer_state_relocation(self, new_strategy: dict = None):
++        placement = get_placement(self.tf_config, new_strategy)
++        strategy_version = None
++        if isinstance(new_strategy, dict):
++            strategy_version = new_strategy.get("strategy_version", new_strategy.get("version"))
++
++        try:
++            from mindspeed.core.transformer.moe.expert_placement.executor import set_expert_placement
++        except ImportError as exc:
++            raise NotImplementedError("MindSpeed external expert placement entry is unavailable.") from exc
++
++        result = set_expert_placement(
++            self.module,
++            self.optimizer,
++            placement,
++            strategy_version=strategy_version,
++            config=self.tf_config,
++        )
++        if not result.get("success", False):
++            raise RuntimeError(f"External expert placement failed: {result.get('message', result)}")
++        return result
++
++    def enqueue_expert_weight_and_optimizer_state_relocation(self, new_strategy: dict = None):
++        self._pending_eplb_strategy = new_strategy
++
++    def apply_pending_expert_weight_and_optimizer_state_relocation(self):
++        if self._pending_eplb_strategy is None:
++            return None
++        new_strategy = self._pending_eplb_strategy
++        self._pending_eplb_strategy = None
++        return self._do_expert_weight_and_optimizer_state_relocation(new_strategy=new_strategy)
++
++    def expert_weight_and_optimizer_state_relocation(
++        self,
++        new_strategy: dict = None,
++        allow_load_offload: bool = False,
++    ):
++        if not allow_load_offload:
++            return self._do_expert_weight_and_optimizer_state_relocation(new_strategy=new_strategy)
++
++        should_context_switch = self._is_offload_param or self._is_offload_optimizer
++        if not should_context_switch:
++            return self._do_expert_weight_and_optimizer_state_relocation(new_strategy=new_strategy)
++
++        try:
++            self.to(
++                device=get_device_name(),
++                model=self._is_offload_param,
++                optimizer=self._is_offload_optimizer,
++                grad=False,
++            )
++            return self._do_expert_weight_and_optimizer_state_relocation(new_strategy=new_strategy)
++        finally:
++            self.to(
++                device="cpu",
++                model=self._is_offload_param,
++                optimizer=self._is_offload_optimizer,
++                grad=False,
++            )
++
+     def _maybe_enable_fused_kernels(self):
+         if not self.engine_config.use_fused_kernels:
+             return
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index bf379b49..65127834 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -273,6 +273,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
+             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+             Timer(name="train_batch", logger=None),
+         ):
++            apply_pending_relocation = getattr(
++                self.engine,
++                "apply_pending_expert_weight_and_optimizer_state_relocation",
++                None,
++            )
++            if apply_pending_relocation is not None:
++                apply_pending_relocation()
++
+             # update
+             output_lst = []
+             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+@@ -569,6 +577,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 self.config.actor.ppo_micro_batch_size_per_gpu
+             )
+             actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
++            actor_training_config.engine_config.train_eplb_strategy_path = actor_config.train_eplb_strategy_path
++            actor_training_config.engine_config.eplb_mode = actor_config.eplb_mode
++            actor_training_config.engine_config.eplb_enable = actor_config.eplb_enable
+ 
+             if self.config.actor.use_dynamic_bsz:
+                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None
+@@ -653,6 +664,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         output = self.actor.train_mini_batch(data=data)
+         return output.cpu() if output is not None else None
+ 
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def expert_weight_and_optimizer_state_relocation(
++        self,
++        new_strategy: dict = None,
++        defer: bool = False,
++        allow_load_offload: bool = False,
++    ):
++        assert "actor" in self.role, "expert relocation only supports actor role"
++        if defer:
++            enqueue = getattr(self.actor.engine, "enqueue_expert_weight_and_optimizer_state_relocation", None)
++            if enqueue is None:
++                raise NotImplementedError(
++                    f"{type(self.actor.engine).__name__} does not implement deferred expert weight relocation."
++                )
++            return enqueue(new_strategy=new_strategy)
++
++        relocate = getattr(self.actor.engine, "expert_weight_and_optimizer_state_relocation", None)
++        if relocate is None:
++            raise NotImplementedError(
++                f"{type(self.actor.engine).__name__} does not implement expert weight relocation."
++            )
++        return relocate(new_strategy=new_strategy, allow_load_offload=allow_load_offload)
++
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+         assert "actor" in self.role, "load_checkpoint only support actor role"
+@@ -664,7 +698,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+-    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
++    async def update_weights(self, global_steps: int = None, mode: str = "auto", eplb_strategy: dict = None):
+         """Update weights from trainer to rollout.
+ 
+         1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
+@@ -678,6 +712,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         Args:
+             global_steps: Current global training step count, passed to rollout for logging/tracking.
++            eplb_strategy: Optional rollout expert placement strategy applied after weights are loaded.
+             mode: Weight update strategy. Supported values:
+                 - ``"auto"``: Automatically resolve to the backend configured in
+                   ``config.rollout.checkpoint_engine.backend`` (default).
+@@ -723,11 +758,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 layered_summon=self.layered_summon, base_sync_done=False
+             )
+             await self.rollout.update_weights(
+-                per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
++                per_tensor_param_base,
++                peft_config=peft_config,
++                base_sync_done=False,
++                global_steps=global_steps,
++                eplb_strategy=eplb_strategy,
+             )
+ 
+         await self.rollout.update_weights(
+-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
++            per_tensor_param,
++            peft_config=peft_config,
++            base_sync_done=True,
++            global_steps=global_steps,
++            eplb_strategy=eplb_strategy,
+         )
+ 
+         log_gpu_memory_usage("After update_weights", logger=logger)
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index a8045f31..eb757029 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -16,6 +16,7 @@ import json
+ import logging
+ import os
+ import platform
++import re
+ import signal
+ import threading
+ from collections.abc import Mapping
+@@ -35,6 +36,12 @@ from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_u
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
++EPLB_TRAINING_STRATEGY_KEY = "_training_strategy"
++EPLB_PER_EXPERT_WEIGHT_RE = re.compile(
++    r"(?P<prefix>.*(?:^|\.)layers\.(?P<layer_id>\d+)\.mlp\.experts\.)"
++    r"(?P<expert_id>\d+)(?P<suffix>\..*)$"
++)
++
+ # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
+ VLLM_LORA_INT_ID = 123
+ VLLM_LORA_NAME = "123"
+@@ -43,6 +50,146 @@ VLLM_LORA_PATH = "simon_lora_path"
+ VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+ 
+ 
++def _eplb_layer_id_from_weight_name(name: str) -> Optional[int]:
++    if re.search(r"\.mlp\.experts\.\d+\.", name):
++        return None
++
++    match = re.search(r"(?:^|\.)layers\.(\d+)\.mlp\.experts(?:\.|$)", name)
++    if match is None:
++        return None
++    return int(match.group(1))
++
++
++def _eplb_layer_expert_order(eplb_strategy: dict, layer_id: int) -> Optional[list[int]]:
++    if not isinstance(eplb_strategy, dict):
++        return None
++
++    for layer_config in eplb_strategy.get("layer_list", []):
++        if layer_config.get("layer_id") != layer_id:
++            continue
++        device_list = sorted(
++            layer_config.get("device_list", []),
++            key=lambda device: int(device.get("device_id", 0)),
++        )
++        expert_order: list[int] = []
++        for device in device_list:
++            expert_order.extend(int(expert) for expert in device.get("device_expert", []))
++        return expert_order
++    return None
++
++
++def _remap_eplb_per_expert_weight_name_with_reason(
++    name: str,
++    eplb_strategy: Optional[dict],
++) -> tuple[str, str, dict]:
++    match = EPLB_PER_EXPERT_WEIGHT_RE.match(name)
++    if match is None:
++        return name, "not_per_expert_name", {}
++
++    layer_id = int(match.group("layer_id"))
++    exported_expert_id = int(match.group("expert_id"))
++    source_strategy = eplb_strategy.get(EPLB_TRAINING_STRATEGY_KEY) if isinstance(eplb_strategy, dict) else None
++    source_order = _eplb_layer_expert_order(source_strategy, layer_id) if isinstance(source_strategy, dict) else None
++    if source_order is None:
++        return name, "per_expert_no_source_strategy", {"layer": layer_id, "expert": exported_expert_id}
++    if exported_expert_id >= len(source_order):
++        return (
++            name,
++            "per_expert_source_len_mismatch",
++            {"layer": layer_id, "expert": exported_expert_id, "source_len": len(source_order)},
++        )
++
++    logical_expert_id = int(source_order[exported_expert_id])
++    if logical_expert_id == exported_expert_id:
++        return name, "per_expert_identity", {"layer": layer_id, "expert": exported_expert_id}
++
++    new_name = f"{match.group('prefix')}{logical_expert_id}{match.group('suffix')}"
++    return (
++        new_name,
++        "per_expert_renamed",
++        {"layer": layer_id, "from": exported_expert_id, "to": logical_expert_id},
++    )
++
++
++def _reorder_eplb_expert_weight_tensor(
++    name: str,
++    tensor: torch.Tensor,
++    eplb_strategy: Optional[dict],
++) -> torch.Tensor:
++    new_tensor, _, _ = _reorder_eplb_expert_weight_tensor_with_reason(name, tensor, eplb_strategy)
++    return new_tensor
++
++
++def _reorder_eplb_expert_weight_tensor_with_reason(
++    name: str,
++    tensor: torch.Tensor,
++    eplb_strategy: Optional[dict],
++) -> tuple[torch.Tensor, str, dict]:
++    """Restore fused expert tensors to logical expert order before vLLM loading."""
++    if not isinstance(eplb_strategy, dict) or not isinstance(tensor, torch.Tensor) or tensor.dim() == 0:
++        return tensor, "invalid_input", {"is_tensor": isinstance(tensor, torch.Tensor)}
++
++    layer_id = _eplb_layer_id_from_weight_name(name)
++    if layer_id is None:
++        reason = "per_expert_name" if re.search(r"\.mlp\.experts\.\d+\.", name) else "not_expert_param"
++        return tensor, reason, {"shape": list(tensor.shape)}
++
++    source_strategy = eplb_strategy.get(EPLB_TRAINING_STRATEGY_KEY)
++    source_order = _eplb_layer_expert_order(source_strategy, layer_id) if isinstance(source_strategy, dict) else None
++    if source_order is None:
++        return tensor, "fused_no_source_strategy", {"layer": layer_id, "shape": list(tensor.shape)}
++    if len(source_order) != tensor.shape[0]:
++        return (
++            tensor,
++            "source_len_mismatch",
++            {
++                "layer": layer_id,
++                "shape0": int(tensor.shape[0]),
++                "source_len": len(source_order),
++                "shape": list(tensor.shape),
++            },
++        )
++
++    source_index_by_expert = {expert: idx for idx, expert in enumerate(source_order)}
++    try:
++        gather_index = [source_index_by_expert[expert] for expert in range(tensor.shape[0])]
++    except KeyError:
++        return (
++            tensor,
++            "source_missing_logical_expert",
++            {"layer": layer_id, "source_head": source_order[:8]},
++        )
++
++    if gather_index == list(range(tensor.shape[0])):
++        return tensor, "identity_order", {"layer": layer_id, "shape": list(tensor.shape)}
++
++    index_tensor = torch.tensor(gather_index, dtype=torch.long, device=tensor.device)
++    return (
++        tensor.index_select(0, index_tensor).contiguous(),
++        "changed",
++        {"layer": layer_id, "shape": list(tensor.shape), "gather_head": gather_index[:8]},
++    )
++
++
++def _reorder_eplb_expert_weight_updates(
++    weights: list[tuple[str, torch.Tensor]],
++    eplb_strategy: Optional[dict],
++) -> list[tuple[str, torch.Tensor]]:
++    if not isinstance(eplb_strategy, dict):
++        return weights
++
++    reordered = []
++    for name, tensor in weights:
++        new_name, reason, _ = _remap_eplb_per_expert_weight_name_with_reason(name, eplb_strategy)
++        if reason == "not_per_expert_name":
++            new_tensor, _, _ = _reorder_eplb_expert_weight_tensor_with_reason(name, tensor, eplb_strategy)
++        else:
++            new_tensor = tensor
++        reordered.append((new_name, new_tensor))
++
++    return reordered
++
++
+ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
+     worker_local_rank = int(worker_local_rank)
+     if parallel_config is None:
+@@ -226,7 +373,13 @@ class vLLMColocateWorkerExtension:
+             # patch weight loader to support MoE model
+             patch_vllm_moe_model_weight_loader(model)
+ 
+-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
++    def update_weights_from_ipc(
++        self,
++        peft_config: dict = None,
++        base_sync_done=False,
++        use_shm: bool = False,
++        eplb_strategy: dict = None,
++    ):
+         """Update the weights of the rollout model."""
+         from vllm.platforms import current_platform
+ 
+@@ -261,6 +414,10 @@ class vLLMColocateWorkerExtension:
+                 patch_vllm_moe_model_weight_loader(model)
+ 
+         assert self.device is not None
++        # Apply the target map once per IPC sync before any weight bucket is loaded.
++        if not (peft_config and base_sync_done) and isinstance(eplb_strategy, dict):
++            self._update_expert_map(eplb_strategy)
++
+         receiver = BucketedWeightReceiver(
+             zmq_handle=self._get_zmq_handle(),
+             device=self.device,
+@@ -268,7 +425,7 @@ class vLLMColocateWorkerExtension:
+         )
+         receiver.receive_weights(
+             on_bucket_received=lambda weights: self._update_weights(
+-                weights, peft_config=peft_config, base_sync_done=base_sync_done
++                weights, peft_config=peft_config, base_sync_done=base_sync_done, eplb_strategy=eplb_strategy
+             )
+         )
+ 
+@@ -291,6 +448,9 @@ class vLLMColocateWorkerExtension:
+             for model, model_config in self._iter_all_models_with_config():
+                 process_weights_after_loading(model, model_config, self.device)
+ 
++        if isinstance(eplb_strategy, dict):
++            self._update_expert_map(eplb_strategy)
++
+     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
+         """Apply buffer updates to the main model and any synced MTP drafter.
+ 
+@@ -303,7 +463,13 @@ class vLLMColocateWorkerExtension:
+             apply_buffer_updates(model, buffer_updates)
+         return loaded
+ 
+-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
++    def _update_weights(
++        self,
++        weights: list[tuple[str, torch.Tensor]],
++        peft_config: dict,
++        base_sync_done: bool,
++        eplb_strategy: dict = None,
++    ):
+         if peft_config and base_sync_done:
+             weights = dict(weights)
+             lora_request = TensorLoRARequest(
+@@ -317,6 +483,7 @@ class vLLMColocateWorkerExtension:
+             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+         else:
+             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
++            param_updates = _reorder_eplb_expert_weight_updates(param_updates, eplb_strategy)
+             # Add the FP8 related logic here as sharding manager has been deprecated.
+             # Check if FP8 quantization is enabled and apply appropriate weight loading
+             if is_fp8_model(self.model_runner.vllm_config):
+@@ -340,6 +507,57 @@ class vLLMColocateWorkerExtension:
+                     f"loaded_params: {len(param_updates)}, loaded_buffers: {loaded_buffers}"
+                 )
+ 
++    def _get_model_layers(self):
++        model = self.model_runner.model
++        if hasattr(model, "language_model"):
++            return model.language_model.model.layers
++        return model.model.layers
++
++    def _update_expert_map(self, eplb_strategy: dict = None):
++        if not isinstance(eplb_strategy, dict):
++            return
++
++        from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
++
++        layer_configs = {item["layer_id"]: item["device_list"] for item in eplb_strategy.get("layer_list", [])}
++        moe_layer_count = eplb_strategy.get("moe_layer_count", 0)
++
++        for idx, layer in enumerate(self._get_model_layers()):
++            if idx >= moe_layer_count or idx not in layer_configs:
++                continue
++
++            mlp = getattr(layer, "mlp", None)
++            fused_moe = getattr(mlp, "experts", None)
++            if fused_moe is None:
++                continue
++
++            config = fused_moe.moe_config
++            num_experts = int(getattr(config, "num_experts", 0))
++            for device in layer_configs[idx][: config.ep_size]:
++                if device.get("device_expert"):
++                    num_experts = max(num_experts, max(device["device_expert"]) + 1)
++            global_expert_map = torch.full((config.ep_size, num_experts), -1, dtype=torch.int32)
++            for rank_id, device in enumerate(layer_configs[idx][: config.ep_size]):
++                local_experts = torch.tensor(device["device_expert"], dtype=torch.long)
++                global_expert_map[rank_id, local_experts] = torch.arange(len(local_experts), dtype=torch.int32)
++
++            expected_log2phy = generate_log2phy_map(global_expert_map, config.ep_rank)
++            local_expert_map = global_expert_map[config.ep_rank].clone()
++            actual_expert_map = getattr(fused_moe, "_expert_map", None)
++            if torch.is_tensor(actual_expert_map):
++                local_expert_map = local_expert_map.to(device=actual_expert_map.device)
++            if hasattr(fused_moe, "update_expert_map"):
++                fused_moe.update_expert_map(local_expert_map)
++            else:
++                fused_moe._expert_map = local_expert_map
++
++            fused_moe.global_expert_map = global_expert_map
++            actual_log2phy = getattr(fused_moe, "log2phy", None)
++            if torch.is_tensor(actual_log2phy):
++                fused_moe.log2phy = expected_log2phy.to(device=actual_log2phy.device)
++            else:
++                fused_moe.log2phy = expected_log2phy.npu()
++
+     def _get_zmq_handle(self) -> str:
+         """Get ZMQ handle for communication.
+         Uses Ray job id + replica_rank + rollout-local rank to match the sender

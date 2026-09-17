@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - ppo_trainer
+  - _self_
+  - mode: dynamic
+  - override model_engine: megatron
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+  job:
+    chdir: false
+
+actor_rollout_ref:
+  actor:
+    eplb_enable: false
+    eplb_mode: Static
+    train_eplb_strategy_path: ""
+  rollout:
+    name: vllm
+    eplb_strategy_file_path: null
+    rollout_eplb_strategy_path: ""
+
+trainer:
+  project_name: eplb_recipe
+  experiment_name: eplb
+  resume_mode: disable
+  eplb_update_interval: 20
+  eplb_load_collection_enable: false
+  eplb_load_collection_steps: 100
+  eplb_load_output_path: ./outputs/eplb/expert_load.json
+

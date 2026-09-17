@@ -70,6 +70,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | dynamo | [`recipe/dynamo/REQUIRED_VERL.txt`](dynamo/REQUIRED_VERL.txt) |
 | echo | [`recipe/echo/REQUIRED_VERL.txt`](echo/REQUIRED_VERL.txt) |
 | entropy | [`recipe/entropy/REQUIRED_VERL.txt`](entropy/REQUIRED_VERL.txt) |
+| eplb | [`recipe/eplb/REQUIRED_VERL.txt`](eplb/REQUIRED_VERL.txt) |
 | fapo | [`recipe/fapo/REQUIRED_VERL.txt`](fapo/REQUIRED_VERL.txt) |
 | fault_recover | [`recipe/fault_recover/REQUIRED_VERL.txt`](fault_recover/REQUIRED_VERL.txt) |
 | flash_rl_ascend | [`recipe/flash_rl_ascend/REQUIRED_VERL.txt`](flash_rl_ascend/REQUIRED_VERL.txt) |
@@ -106,6 +107,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 - [partial_rollout](./partial_rollout/): synchronous RL with cross-step rollout interruption + resume to reclaim long-tail GPU bubbles ([APRIL](https://arxiv.org/pdf/2509.18521)-style).
 - [verl_tinker](./verl_tinker/): Tinker-compatible HTTP server backed by VeRL actors, with separate Tinker cookbook client examples.
 - [specRL/rl_spec](./specRL/rl_spec/): accelerating RL rollout with a co-adapted diffusion drafter ([DFlash](https://github.com/z-lab/dflash)), via Split-KV context parallelism for drafter training and entropy-boosted anchor sampling.
+- [eplb](./eplb/): Expert-Parallel Load Balancing for MoE RL on Ascend NPU — baseline / load-collection / static / dynamic expert placement, with Megatron-MindSpeed training and vLLM-Ascend rollout.
 - TBA...
 
 ## Contribution

@@ -1,0 +1,6 @@
+pytest>=8
+ruff>=0.9
+# Native RayPPOTrainer imports rollout service helpers even in CPU-only tests.
+cachetools
+fastapi
+uvicorn

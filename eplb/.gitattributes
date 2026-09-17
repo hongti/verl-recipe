@@ -1,0 +1,7 @@
+# Everything in this recipe is text and must keep LF endings on every platform.
+# The patches under patches/ are applied with `git apply` and every hunk fails on
+# context if the working tree is CRLF; the scripts run under bash; and
+# REQUIRED_VERL.txt is parsed with awk, where a trailing CR corrupts the value.
+# Without this, a checkout (or `git archive`) under core.autocrlf=true converts
+# them and the documented install path breaks.
+* text=auto eol=lf

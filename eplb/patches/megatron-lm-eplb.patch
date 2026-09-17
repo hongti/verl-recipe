@@ -1,0 +1,58 @@
+diff --git a/megatron/core/distributed/param_and_grad_buffer.py b/megatron/core/distributed/param_and_grad_buffer.py
+index b192f182d..e02af91f6 100644
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -695,7 +695,18 @@ class _ParamAndGradBuffer:
+             # Return the potentially padded bucket_end_index.
+             return bucket_end_index
+ 
+-        def _does_param_require_new_bucket(param):
++        # Split expert weights across several buckets so that expert relocation
++        # does not have to allocate one temporary buffer sized for all experts.
++        num_buckets_for_expert_weights = 4
++        expert_params = [param for param in params[::-1] if not getattr(param, "allreduce", True)]
++        num_expert_weights_per_bucket = (
++            math.ceil(len(expert_params) / num_buckets_for_expert_weights)
++            if len(expert_params) > 0
++            else 0
++        )
++        expert_param_index = 0
++
++        def _does_param_require_new_bucket(param, require_new_bucket_for_expert_weight=False):
+             """
+             Split shared embedding parameters into separate bucket if using distributed
+             optimizer that makes use of reduce-scatters instead of all-reduces.
+@@ -704,7 +715,10 @@ class _ParamAndGradBuffer:
+             the DP reduce-scatter to be before the embedding all-reduce.
+             """
+             return (
+-                getattr(param, "shared_embedding", False)
++                (
++                    getattr(param, "shared_embedding", False)
++                    or require_new_bucket_for_expert_weight
++                )
+                 and self.ddp_config.use_distributed_optimizer
+             )
+ 
+@@ -713,9 +727,20 @@ class _ParamAndGradBuffer:
+ 
+             this_numel = param.data.nelement()
+             param_start_index = _pad_start_of_param_if_needed(param_start_index)
++            is_expert_param = not getattr(param, "allreduce", True)
++            require_new_bucket_for_expert_weight = False
++            if is_expert_param and num_expert_weights_per_bucket > 0:
++                require_new_bucket_for_expert_weight = (
++                    expert_param_index % num_expert_weights_per_bucket == 0
++                    and expert_param_index != 0
++                )
++                expert_param_index += 1
+ 
+             # Create bucket with collected parameters if current param needs its own bucket.
+-            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
++            if (
++                _does_param_require_new_bucket(param, require_new_bucket_for_expert_weight)
++                and len(bucket_params) > 0
++            ):
+                 # Ensure this param accounts for the new padding introduced at end of
+                 # previous bucket.
+                 param_start_index = _update_bucket_metadata(param_start_index)

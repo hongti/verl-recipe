@@ -1,0 +1,13 @@
+# @package _global_
+actor_rollout_ref:
+  actor:
+    eplb_enable: true
+    eplb_mode: Dynamic
+    megatron:
+      router_replay:
+        mode: R3
+  rollout:
+    enable_rollout_routing_replay: true
+trainer:
+  experiment_name: dynamic
+

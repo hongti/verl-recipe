@@ -1,0 +1,2004 @@
+diff --git a/mindspeed/core/transformer/moe/expert_placement/executor.py b/mindspeed/core/transformer/moe/expert_placement/executor.py
+index 5305da21..317f0a07 100644
+--- a/mindspeed/core/transformer/moe/expert_placement/executor.py
++++ b/mindspeed/core/transformer/moe/expert_placement/executor.py
+@@ -1,8 +1,10 @@
+ # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+ import math
++import re
+ from logging import getLogger
+ from typing import Dict, List
++import numpy as np
+ import torch
+ from megatron.core import parallel_state, tensor_parallel, mpu
+ from megatron.training import get_args
+@@ -21,6 +23,67 @@ from mindspeed.core.transformer.moe.expert_placement.optimizer_state_placement_m
+ from mindspeed.core.transformer.moe.expert_placement.planner import gather_expert_load_data_parallel
+ 
+ 
++def _get_local_expert_count(mlp):
++    return int(mlp.experts.num_local_experts)
++
++
++_TE_GROUPED_EXPERT_PARAM_RE = re.compile(
++    r"\.mlp\.experts\.(linear_fc[12])\.weight(\d+)(?:$|\.)"
++)
++
++
++def _get_te_grouped_expert_param_match(name):
++    return _TE_GROUPED_EXPERT_PARAM_RE.search(name)
++
++
++def _is_te_grouped_expert_optimizer_param(name):
++    return _get_te_grouped_expert_param_match(name) is not None
++
++
++def _is_legacy_grouped_expert_optimizer_param(name):
++    return (
++        ".mlp.experts.weight" in name
++        and ".mlp.experts.linear_fc" not in name
++    )
++
++
++def _is_router_optimizer_relocation_param(name):
++    return ".mlp.router" in name
++
++
++def _is_optimizer_relocation_param(name):
++    return (
++        _is_legacy_grouped_expert_optimizer_param(name)
++        or _is_te_grouped_expert_optimizer_param(name)
++        or _is_router_optimizer_relocation_param(name)
++    )
++
++
++def _get_te_grouped_expert_param_slot_and_group_name(name):
++    match = _get_te_grouped_expert_param_match(name)
++    if match is None:
++        return None, None
++    return int(match.group(2)), name[:match.start(2)]
++
++
++def _bucket_contains_param(bucket, param):
++    bucket_params = getattr(bucket, "params", None)
++    if bucket_params is None:
++        bucket_params = set(getattr(bucket, "params_list", []))
++    return param in bucket_params
++
++
++def _get_optimizer_expert_relocation_entry(optimizer, bucket, param):
++    params_module_mlp_map = getattr(optimizer, "params_module_mlp_map", {})
++    if param not in params_module_mlp_map or not _bucket_contains_param(bucket, param):
++        return None
++    mlp, name = params_module_mlp_map[param]
++    if not _is_optimizer_relocation_param(name):
++        return None
++    if not getattr(mlp, "expert_placement_layer_permission", False):
++        return None
++    return mlp, name
++
+ 
+ def build_param_params_module_mlp_map(model_chunks):
+     params_module_mlp_map = {}
+@@ -28,12 +91,18 @@ def build_param_params_module_mlp_map(model_chunks):
+         for name, param in model_chunk.named_parameters():
+             if not param.requires_grad:
+                 continue
+-            if (".mlp.experts.weight" in name or ".mlp.router" in name) and "mtp.layers" not in name:
++            if (
++                _is_optimizer_relocation_param(name)
++                and "mtp.layers" not in name
++            ):
+                 parts = name.split('layers.')
+                 layer_number = int(parts[1].split('.')[0])
+                 module_mlp = model_chunk.module.module.decoder.layers[layer_number].mlp
+                 params_module_mlp_map.update({param: [module_mlp, name]})
+-            elif (".mlp.experts.weight" in name or ".mlp.router" in name) and "mtp.layers" in name:
++            elif (
++                _is_optimizer_relocation_param(name)
++                and "mtp.layers" in name
++            ):
+                 parts = name.split('layers.')
+                 layer_number = int(parts[1].split('.')[0])
+                 module_mlp = model_chunk.module.module.mtp.layers[layer_number].transformer_layer.mlp
+@@ -41,6 +110,426 @@ def build_param_params_module_mlp_map(model_chunks):
+     return params_module_mlp_map
+ 
+ 
++def _result(success, changed=False, strategy_version=None, message="", changed_layers=None):
++    return {
++        "success": success,
++        "changed": changed,
++        "strategy_version": strategy_version,
++        "changed_layers": changed_layers or [],
++        "message": message,
++    }
++
++
++def _normalize_identifier(value, name):
++    if isinstance(value, bool):
++        raise ValueError(f"{name} must be an integer, got bool")
++    try:
++        normalized = int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
++    if str(normalized) != str(value) and not isinstance(value, int):
++        raise ValueError(f"{name} must be an integer, got {value!r}")
++    return normalized
++
++
++def _normalize_placement(placement):
++    """Normalize an external expert placement into integer ids.
++
++    Args:
++        placement (dict): Mapping from layer id to EP rank and logical expert ids.
++
++    Returns:
++        dict: Placement with integer layer ids, device ids, and expert ids.
++
++    Raises:
++        ValueError: If the placement structure or any identifier is invalid.
++    """
++    if not isinstance(placement, dict) or not placement:
++        raise ValueError("placement must be a non-empty dict")
++
++    normalized = {}
++    for layer_id, device_placement in placement.items():
++        layer_id = _normalize_identifier(layer_id, "layer_id")
++        if layer_id in normalized:
++            raise ValueError(f"duplicate layer_id {layer_id}")
++        if not isinstance(device_placement, dict) or not device_placement:
++            raise ValueError(f"placement for layer {layer_id} must be a non-empty dict")
++
++        normalized[layer_id] = {}
++        for device_id, experts in device_placement.items():
++            device_id = _normalize_identifier(device_id, "device_id")
++            if device_id in normalized[layer_id]:
++                raise ValueError(f"duplicate device_id {device_id} in layer {layer_id}")
++            if not isinstance(experts, (list, tuple)):
++                raise ValueError(
++                    f"experts for layer {layer_id}, device {device_id} must be a list"
++                )
++            normalized[layer_id][device_id] = [
++                _normalize_identifier(expert_id, "expert_id") for expert_id in experts
++            ]
++    return normalized
++
++
++def _unwrap_model_chunk(model_chunk):
++    module = model_chunk
++    visited = set()
++    while hasattr(module, "module") and id(module) not in visited:
++        visited.add(id(module))
++        module = module.module
++    if hasattr(module, "language_model"):
++        module = module.language_model
++    return module
++
++
++def _iter_moe_mlps(model):
++    """Iterate over local MoE MLP modules from Megatron model chunks.
++
++    Args:
++        model: A model chunk or a list of model chunks.
++
++    Yields:
++        tuple[int, object]: The zero-based layer id and its MoE MLP module.
++    """
++    model_chunks = model if isinstance(model, (list, tuple)) else [model]
++    seen = set()
++    for model_chunk in model_chunks:
++        module = _unwrap_model_chunk(model_chunk)
++        decoder = getattr(module, "decoder", None)
++        if decoder is not None:
++            for local_layer_id, layer in enumerate(decoder.layers):
++                mlp = getattr(layer, "mlp", None)
++                if mlp is None or not hasattr(mlp, "router") or id(mlp) in seen:
++                    continue
++                seen.add(id(mlp))
++                layer_number = getattr(layer, "layer_number", local_layer_id + 1)
++                yield int(layer_number) - 1, mlp
++
++        mtp = getattr(module, "mtp", None)
++        if mtp is None:
++            continue
++        for local_layer_id, mtp_layer in enumerate(mtp.layers):
++            layer = getattr(mtp_layer, "transformer_layer", None)
++            mlp = getattr(layer, "mlp", None)
++            if mlp is None or not hasattr(mlp, "router") or id(mlp) in seen:
++                continue
++            seen.add(id(mlp))
++            layer_number = getattr(layer, "layer_number", local_layer_id + 1)
++            yield int(layer_number) - 1, mlp
++
++
++def _get_num_moe_experts(config):
++    """Get the configured number of logical MoE experts.
++
++    Args:
++        config: The MoE module config.
++
++    Returns:
++        int: Number of logical MoE experts.
++
++    Raises:
++        ValueError: If expert count fields are missing or inconsistent.
++    """
++    num_moe_experts = getattr(config, "num_moe_experts", None)
++    num_experts = getattr(config, "num_experts", None)
++    if num_moe_experts is None:
++        num_moe_experts = num_experts
++    elif num_experts is not None and num_experts != num_moe_experts:
++        raise ValueError(
++            f"num_experts ({num_experts}) and num_moe_experts "
++            f"({num_moe_experts}) must be consistent"
++        )
++    if num_moe_experts is None:
++        raise ValueError("model config does not define num_moe_experts or num_experts")
++    return int(num_moe_experts)
++
++
++def _get_expert_placement_world_size(mlp):
++    return parallel_state.get_expert_model_parallel_world_size()
++
++
++def _iter_te_grouped_expert_weight_tensors(experts):
++    for linear_name in ("linear_fc1", "linear_fc2"):
++        linear = getattr(experts, linear_name, None)
++        if linear is None:
++            continue
++        if hasattr(linear, "weight"):
++            yield linear.weight
++        for name in dir(linear):
++            if name.startswith("weight"):
++                weight = getattr(linear, name)
++                if torch.is_tensor(weight):
++                    yield weight
++
++
++def _get_expert_weight_device(experts):
++    for weight in _iter_te_grouped_expert_weight_tensors(experts):
++        return weight.device
++    raise ValueError(
++        "external expert placement requires TEGroupedMLP experts with "
++        "linear_fc1/linear_fc2 weights"
++    )
++
++
++def _validate_and_build_external_mappings(placement, layer_mlps):
++    """Validate placement and convert it to MindSpeed expert mappings.
++
++    Args:
++        placement (dict): Normalized placement keyed by layer id and EP rank.
++        layer_mlps (dict): Local MoE MLP modules keyed by zero-based layer id.
++
++    Returns:
++        dict: Target expert mappings keyed by layer id.
++
++    Raises:
++        ValueError: If placement does not match the local MoE topology.
++    """
++    mappings = {}
++    local_layer_ids = set(layer_mlps)
++    missing_layers = sorted(local_layer_ids - set(placement))
++    if missing_layers:
++        raise ValueError(f"placement is missing local MoE layers: {missing_layers}")
++
++    for layer_id, mlp in layer_mlps.items():
++        if getattr(mlp.config, "moe_tp_extend_ep", False):
++            raise ValueError(
++                "external expert placement does not support --moe-tp-extend-ep"
++            )
++        layer_placement = placement[layer_id]
++        ep_world_size = _get_expert_placement_world_size(mlp)
++        num_local_experts = _get_local_expert_count(mlp)
++        num_moe_experts = _get_num_moe_experts(mlp.config)
++        expected_devices = set(range(ep_world_size))
++        actual_devices = set(layer_placement)
++        if actual_devices != expected_devices:
++            raise ValueError(
++                f"layer {layer_id} device ids must be {sorted(expected_devices)}, "
++                f"got {sorted(actual_devices)}"
++            )
++        if num_moe_experts != ep_world_size * num_local_experts:
++            raise ValueError(
++                f"layer {layer_id} expects {num_moe_experts} experts, but topology "
++                f"provides {ep_world_size} devices * {num_local_experts} slots"
++            )
++        if (
++            hasattr(mlp, "expert_mapping")
++            and mlp.expert_mapping.numel() != num_moe_experts
++        ):
++            raise ValueError(
++                f"layer {layer_id} expert_mapping contains "
++                f"{mlp.expert_mapping.numel()} entries, expected {num_moe_experts}"
++            )
++
++        flattened = []
++        for device_id in range(ep_world_size):
++            experts = layer_placement[device_id]
++            if len(experts) != num_local_experts:
++                raise ValueError(
++                    f"layer {layer_id}, device {device_id} must contain "
++                    f"{num_local_experts} experts, got {len(experts)}"
++                )
++            flattened.extend(experts)
++
++        if sorted(flattened) != list(range(num_moe_experts)):
++            raise ValueError(
++                f"layer {layer_id} must contain every expert id in "
++                f"[0, {num_moe_experts}) exactly once"
++            )
++
++        device = _get_expert_weight_device(mlp.experts)
++        physical_to_logical = torch.tensor(flattened, dtype=torch.long, device=device)
++        mappings[layer_id] = torch.argsort(physical_to_logical).to(dtype=torch.int)
++    return mappings
++
++
++def _ensure_external_placement_state(mlp):
++    """Prepare the per-layer state required by expert relocation.
++
++    Args:
++        mlp: Local MoE MLP module to be relocated.
++
++    Raises:
++        ValueError: If the existing expert mapping size is invalid.
++    """
++    num_moe_experts = _get_num_moe_experts(mlp.config)
++    ep_world_size = _get_expert_placement_world_size(mlp)
++    num_local_experts = _get_local_expert_count(mlp)
++    device = _get_expert_weight_device(mlp.experts)
++
++    if not hasattr(mlp, "expert_mapping"):
++        mlp.expert_mapping = torch.arange(
++            num_moe_experts, dtype=torch.int, device=device
++        )
++    if mlp.expert_mapping.numel() != num_moe_experts:
++        raise ValueError(
++            f"expert_mapping contains {mlp.expert_mapping.numel()} entries, "
++            f"expected {num_moe_experts}"
++        )
++
++    mlp.ep_world_size = ep_world_size
++    if not hasattr(mlp, "input_splits_for_expert_placement"):
++        mlp.input_splits_for_expert_placement = np.zeros(ep_world_size, dtype=np.int32)
++    if not hasattr(mlp, "output_splits_for_expert_placement"):
++        mlp.output_splits_for_expert_placement = np.zeros(ep_world_size, dtype=np.int32)
++    if (
++        not hasattr(mlp, "local_resorted_relative_mapping_indices")
++        or mlp.local_resorted_relative_mapping_indices.numel() != num_local_experts
++    ):
++        mlp.local_resorted_relative_mapping_indices = torch.zeros(
++            num_local_experts, dtype=torch.int, device=device
++        )
++    if (
++        not hasattr(mlp, "new_local_expert_sorted_indices")
++        or mlp.new_local_expert_sorted_indices.numel() != num_local_experts
++    ):
++        mlp.new_local_expert_sorted_indices = torch.zeros(
++            num_local_experts, dtype=torch.int, device=device
++        )
++    mlp.expert_placement_layer_permission = False
++
++
++def _set_optimizer_mlp_map(model, optimizer):
++    """Ensure optimizers have the parameter-to-MLP mapping used by relocation.
++
++    Args:
++        model: A model chunk or a list of model chunks.
++        optimizer: Optimizer or chained optimizer.
++
++    Returns:
++        list: Optimizers with ``params_module_mlp_map`` initialized.
++    """
++    optimizers = (
++        optimizer.chained_optimizers
++        if hasattr(optimizer, "chained_optimizers")
++        else [optimizer]
++    )
++    params_module_mlp_map = {
++        param: item
++        for param, item in build_param_params_module_mlp_map(
++            model if isinstance(model, (list, tuple)) else [model]
++        ).items()
++        if _is_te_grouped_expert_optimizer_param(item[1])
++    }
++    for sub_optimizer in optimizers:
++        sub_optimizer.params_module_mlp_map = params_module_mlp_map
++    return optimizers
++
++
++def set_expert_placement(model, optimizer, placement, strategy_version=None, config=None):
++    """Apply an externally generated expert placement to local MoE layers.
++
++    Args:
++        model: A model chunk or a list of model chunks.
++        optimizer: Optimizer whose expert states should follow the weight relocation.
++        placement (dict): Mapping from layer id to EP rank and logical expert ids.
++        strategy_version: Optional external strategy version to record on layers.
++        config: Optional Megatron/MindSpeed config object. When omitted, global
++        Megatron args are used.
++
++    Returns:
++        dict: Result containing success, changed, strategy_version, changed_layers,
++        and message fields. Validation failures return ``success=False`` before
++        changing expert weights, optimizer states, or router mappings.
++    """
++    config = config if config is not None else get_args()
++    if not getattr(config, "enable_external_expert_placement", False):
++        return _result(
++            False,
++            strategy_version=strategy_version,
++            message="external expert placement requires --enable-external-expert-placement",
++        )
++    if optimizer is None:
++        return _result(
++            False,
++            strategy_version=strategy_version,
++            message="optimizer is required for expert placement",
++        )
++
++    try:
++        normalized_placement = _normalize_placement(placement)
++        layer_mlps = {}
++        for layer_id, mlp in _iter_moe_mlps(model):
++            if layer_id in layer_mlps and layer_mlps[layer_id] is not mlp:
++                raise ValueError(f"multiple local MoE layers use layer_id {layer_id}")
++            layer_mlps[layer_id] = mlp
++        if not layer_mlps:
++            raise ValueError("model does not contain any local MoE layers")
++        external_mappings = _validate_and_build_external_mappings(
++            normalized_placement, layer_mlps
++        )
++        for mlp in layer_mlps.values():
++            current_version = getattr(mlp, "external_expert_placement_version", None)
++            if (
++                strategy_version is not None
++                and current_version is not None
++                and strategy_version < current_version
++            ):
++                raise ValueError(
++                    f"strategy version {strategy_version} is older than "
++                    f"applied version {current_version}"
++                )
++    except (TypeError, ValueError) as exc:
++        return _result(False, strategy_version=strategy_version, message=str(exc))
++
++    changed_layers = []
++    for layer_id, mlp in layer_mlps.items():
++        _ensure_external_placement_state(mlp)
++
++        mlp.router.send_map = mlp.expert_mapping
++        target_mapping = external_mappings[layer_id]
++        if torch.equal(mlp.expert_mapping, target_mapping):
++            continue
++        initialize_expert_placement_dispatcher(mlp, target_mapping)
++        if mlp.expert_placement_layer_permission:
++            changed_layers.append(layer_id)
++
++    if not changed_layers:
++        for mlp in layer_mlps.values():
++            mlp.external_expert_placement_version = strategy_version
++        return _result(
++            True,
++            changed=False,
++            strategy_version=strategy_version,
++            message="expert placement is unchanged",
++        )
++
++    for layer_id in changed_layers:
++        mlp = layer_mlps[layer_id]
++        expert_weight_placement(mlp)
++
++    optimizers = _set_optimizer_mlp_map(model, optimizer)
++    for sub_optimizer in optimizers:
++        optimizer_config = getattr(sub_optimizer, "config", None)
++        reuse_fp32_param = getattr(
++            sub_optimizer,
++            "reuse_fp32_param",
++            getattr(
++                optimizer_config,
++                "reuse_fp32_param",
++                getattr(config, "reuse_fp32_param", False),
++            ),
++        )
++        relocate_expert_optimization_states(
++            sub_optimizer,
++            reuse_fp32_param=bool(reuse_fp32_param),
++            config=config,
++        )
++
++    for mlp in layer_mlps.values():
++        mlp.external_expert_placement_version = strategy_version
++        mlp.expert_placement_layer_permission = False
++    print_rank_0(
++        f"[expert placement] applied external strategy version={strategy_version}, "
++        f"changed_layers={sorted(changed_layers)}"
++    )
++    return _result(
++        True,
++        changed=True,
++        strategy_version=strategy_version,
++        changed_layers=sorted(changed_layers),
++        message="expert placement applied",
++    )
++
++
+ def expert_weight_and_optimizer_state_placement(args, model, optimizer):
+     # relocate model parameters(experts) and corresponding optimizer states 
+     expert_placement_triggered = args.curr_iteration % args.expert_placement_freq == args.expert_placement_freq - 1 
+@@ -71,87 +560,132 @@ def expert_weight_and_optimizer_state_placement(args, model, optimizer):
+                                 expert_bias_and_local_token_count_placement(layer.transformer_layer.mlp)
+         if hasattr(optimizer, "chained_optimizers"):
+             for sub_optimizer in optimizer.chained_optimizers:
+-                relocate_expert_optimization_states(sub_optimizer, reuse_fp32_param=args.reuse_fp32_param)
++                relocate_expert_optimization_states(
++                    sub_optimizer,
++                    reuse_fp32_param=args.reuse_fp32_param,
++                    config=args,
++                )
+         else:
+-            relocate_expert_optimization_states(optimizer, reuse_fp32_param=args.reuse_fp32_param)
++            relocate_expert_optimization_states(
++                optimizer,
++                reuse_fp32_param=args.reuse_fp32_param,
++                config=args,
++            )
+ 
+ 
+-def initialize_expert_placement_dispatcher(mlp):
++def initialize_expert_placement_dispatcher(mlp, new_expert_mapping=None):
+     with torch.no_grad():
+-        mlp.expert_load_prediction.copy_(gather_expert_load_data_parallel(mlp.expert_load_prediction))
+-        # Calc the KL divergence between current and former expert load
+-        # Calc expert placement mapping
+-        ep_devices = list(range(mlp.ep_world_size))
+-        expert_load = dict(zip(range(mlp.config.num_moe_experts), 
+-                               mlp.expert_load_prediction.to(torch.device("cpu")).numpy()))
+-        expert_device_mapping, device_expert_mapping = \
+-            mlp.expert_placement_optimizer.expert_placement_greedy(expert_load, ep_devices)
+-        
+-        # Turn expert_device_mapping into expert_index mapping
+-        device_expert_idx = [set() for i in range(mlp.ep_world_size)]
+-        device_full_expert_idx = {i for i in range(mlp.experts.num_local_experts)}
+-
+-        new_expert_mapping = mlp.expert_mapping.clone()
+-        for i in range(mlp.config.num_moe_experts):
+-            if mlp.expert_mapping[i] // mlp.experts.num_local_experts == expert_device_mapping[i]:
+-                local_idx = mlp.expert_mapping[i] % mlp.experts.num_local_experts
+-                device_expert_idx[expert_device_mapping[i][0]].append(local_idx)
+-                continue
+-            remaining_indices = device_full_expert_idx - device_expert_idx[expert_device_mapping[i][0]]
+-            local_idx = remaining_indices.pop()
+-            new_expert_mapping[i] = expert_device_mapping[i][0] * mlp.experts.num_local_experts + local_idx
+-            device_expert_idx[expert_device_mapping[i][0]].add(local_idx)
++        native_tp_extend_ep = False
++        if new_expert_mapping is None:
++            args = get_args()
++            native_tp_extend_ep = args.moe_tp_extend_ep
++            num_local_experts = _get_local_expert_count(mlp)
++            mlp.expert_load_prediction.copy_(gather_expert_load_data_parallel(mlp.expert_load_prediction))
++            # Calc the KL divergence between current and former expert load
++            # Calc expert placement mapping
++            ep_devices = list(range(mlp.ep_world_size))
++            expert_load = dict(zip(range(mlp.config.num_moe_experts),
++                                   mlp.expert_load_prediction.to(torch.device("cpu")).numpy()))
++            expert_device_mapping, device_expert_mapping = \
++                mlp.expert_placement_optimizer.expert_placement_greedy(expert_load, ep_devices)
+ 
+-        # Calc expert load variation
+-        args = get_args()
+-        
+-        mlp.expert_placement_layer_permission = True
+-        if args.enable_fine_grained_expert_placement:
+-            sorted_expert_mapping, sorted_expert_mapping_indices = torch.sort(mlp.expert_mapping)
+-            expert_load_per_device_pre = mlp.expert_load_prediction[sorted_expert_mapping_indices].reshape(
+-                                                                            -1, mlp.experts.num_local_experts).sum(-1)
+-            expert_load_variation_pre = expert_load_per_device_pre.std() / expert_load_per_device_pre.mean() \
+-                                        if expert_load_per_device_pre.mean() > 0 else expert_load_per_device_pre.std()
+-
+-            sorted_expert_mapping, sorted_expert_mapping_indices = torch.sort(new_expert_mapping)
+-            expert_load_per_device_curr = mlp.expert_load_prediction[sorted_expert_mapping_indices].reshape(
+-                                                                            -1, mlp.experts.num_local_experts).sum(-1)
+-            expert_load_variation_curr = expert_load_per_device_curr.std() / expert_load_per_device_curr.mean() \
+-                                        if expert_load_per_device_curr.mean() > 0 else expert_load_per_device_curr.std()
+-
+-            expert_load_variation_diff = expert_load_variation_pre - expert_load_variation_curr
+-            expert_load_variation_diff_thre = args.fine_grained_expert_placement_thre
+-            if expert_load_variation_diff < expert_load_variation_diff_thre:
+-                mlp.expert_placement_layer_permission = False
+-            if torch.distributed.get_rank() == 0:
+-                print(f"expert_load_variation_pre {expert_load_variation_pre} \
+-                        expert_load_variation_curr {expert_load_variation_curr}")
++            # Turn expert_device_mapping into expert_index mapping
++            device_expert_idx = [set() for i in range(mlp.ep_world_size)]
++            device_full_expert_idx = {i for i in range(num_local_experts)}
++
++            new_expert_mapping = mlp.expert_mapping.clone()
++            for i in range(mlp.config.num_moe_experts):
++                if (
++                    mlp.expert_mapping[i] // num_local_experts
++                    == expert_device_mapping[i]
++                ):
++                    local_idx = mlp.expert_mapping[i] % num_local_experts
++                    device_expert_idx[expert_device_mapping[i][0]].append(local_idx)
++                    continue
++                remaining_indices = (
++                    device_full_expert_idx - device_expert_idx[expert_device_mapping[i][0]]
++                )
++                local_idx = remaining_indices.pop()
++                new_expert_mapping[i] = (
++                    expert_device_mapping[i][0]
++                    * num_local_experts
++                    + local_idx
++                )
++                device_expert_idx[expert_device_mapping[i][0]].add(local_idx)
++
++            # Calc expert load variation
++            mlp.expert_placement_layer_permission = True
++            if args.enable_fine_grained_expert_placement:
++                sorted_expert_mapping, sorted_expert_mapping_indices = torch.sort(
++                    mlp.expert_mapping
++                )
++                expert_load_per_device_pre = mlp.expert_load_prediction[
++                    sorted_expert_mapping_indices
++                ].reshape(-1, num_local_experts).sum(-1)
++                expert_load_variation_pre = (
++                    expert_load_per_device_pre.std()
++                    / expert_load_per_device_pre.mean()
++                    if expert_load_per_device_pre.mean() > 0
++                    else expert_load_per_device_pre.std()
++                )
++
++                sorted_expert_mapping, sorted_expert_mapping_indices = torch.sort(
++                    new_expert_mapping
++                )
++                expert_load_per_device_curr = mlp.expert_load_prediction[
++                    sorted_expert_mapping_indices
++                ].reshape(-1, num_local_experts).sum(-1)
++                expert_load_variation_curr = (
++                    expert_load_per_device_curr.std()
++                    / expert_load_per_device_curr.mean()
++                    if expert_load_per_device_curr.mean() > 0
++                    else expert_load_per_device_curr.std()
++                )
++
++                expert_load_variation_diff = expert_load_variation_pre - expert_load_variation_curr
++                expert_load_variation_diff_thre = args.fine_grained_expert_placement_thre
++                if expert_load_variation_diff < expert_load_variation_diff_thre:
++                    mlp.expert_placement_layer_permission = False
++        else:
++            new_expert_mapping = new_expert_mapping.to(
++                device=mlp.expert_mapping.device,
++                dtype=mlp.expert_mapping.dtype,
++            )
++            if new_expert_mapping.numel() != mlp.expert_mapping.numel():
++                raise ValueError(
++                    f"external expert mapping contains {new_expert_mapping.numel()} "
++                    f"entries, expected {mlp.expert_mapping.numel()}"
++                )
++            mlp.expert_placement_layer_permission = not torch.equal(
++                mlp.expert_mapping, new_expert_mapping
++            )
+ 
+         if not mlp.expert_placement_layer_permission:
+             return
+ 
+         # permuting the experts according to expert_device_mapping        
+-        if args.moe_tp_extend_ep:
++        num_local_experts = _get_local_expert_count(mlp)
++        if native_tp_extend_ep:
+             tp_size = parallel_state.get_tensor_model_parallel_world_size()
+             local_expert_indices_offset = (
+-                    parallel_state.get_expert_model_parallel_rank() * mlp.experts.num_local_experts * tp_size + \
+-                    parallel_state.get_tensor_model_parallel_rank() * mlp.experts.num_local_experts
++                    parallel_state.get_expert_model_parallel_rank() * num_local_experts * tp_size + \
++                    parallel_state.get_tensor_model_parallel_rank() * num_local_experts
+             )
+         else:
+             local_expert_indices_offset = (
+-                parallel_state.get_expert_model_parallel_rank() * mlp.experts.num_local_experts
++                parallel_state.get_expert_model_parallel_rank() * num_local_experts
+             )
+ 
+         experts_local_indices_mask = torch.logical_and(local_expert_indices_offset <= mlp.expert_mapping,
+                                                        mlp.expert_mapping < local_expert_indices_offset +
+-                                                       mlp.experts.num_local_experts)
++                                                       num_local_experts)
+         old_local_expert_mapping = mlp.expert_mapping[experts_local_indices_mask].clone()
+         new_local_expert_mapping = new_expert_mapping[experts_local_indices_mask].clone()
+ 
+         sorted_old_local_expert_mapping, old_local_expert_sorted_indices = torch.sort(old_local_expert_mapping)
+         new_local_expert_mapping = new_local_expert_mapping[old_local_expert_sorted_indices]
+         sorted_local_expert_mapping, new_local_expert_sorted_indices = torch.sort(new_local_expert_mapping)
+-        sorted_local_expert_mapping = sorted_local_expert_mapping // mlp.experts.num_local_experts
++        sorted_local_expert_mapping = sorted_local_expert_mapping // num_local_experts
+         mlp.input_splits_for_expert_placement = torch.histc(sorted_local_expert_mapping, 
+                                                              bins=mlp.ep_world_size, 
+                                                              min=0, 
+@@ -161,7 +695,7 @@ def initialize_expert_placement_dispatcher(mlp):
+         relative_mapping = new_expert_mapping[sorted_expert_mapping_indices].reshape(mlp.ep_world_size, -1)
+         sorted_relative_mapping, sorted_relative_mapping_indices = torch.sort(relative_mapping, dim=1)
+         new_local_device_mapping_mask = (sorted_relative_mapping >= local_expert_indices_offset) & \
+-                                (sorted_relative_mapping < local_expert_indices_offset + mlp.experts.num_local_experts)
++                                (sorted_relative_mapping < local_expert_indices_offset + num_local_experts)
+         local_sorted_relative_mapping = sorted_relative_mapping[new_local_device_mapping_mask]
+         _, local_resorted_relative_mapping_indices = torch.sort(local_sorted_relative_mapping)
+         mlp.output_splits_for_expert_placement = new_local_device_mapping_mask.sum(axis=1).cpu().numpy()
+@@ -173,10 +707,8 @@ def initialize_expert_placement_dispatcher(mlp):
+  
+ 
+ def expert_weight_placement(mlp):
+-    global_args = get_args()
+-    print_rank_0(f"[expert placement] iter {global_args.curr_iteration}: expert_placement_triggered!!!")
+     with torch.no_grad():
+-        if mlp.config.moe_extended_tp:
++        if getattr(mlp.config, "moe_extended_tp", False):
+             return
+         if not mlp.config.moe_tp_extend_ep:
+             tp_size = 1
+@@ -185,20 +717,21 @@ def expert_weight_placement(mlp):
+             tp_size = parallel_state.get_tensor_model_parallel_world_size()
+             expert_placement_group = parallel_state.get_expert_model_parallel_group()
+ 
++        num_local_experts = _get_local_expert_count(mlp)
+         # determine mlp type, todo
+         group_mlp_expert_params = None
+         if mlp.config.moe_grouped_gemm:
+-            group_mlp_expert_params = get_grouped_expert_params(mlp.experts, 
+-                                                                mlp.experts.num_local_experts, 
+-                                                                tp_size, mlp.experts.config)
++            group_mlp_expert_params = get_grouped_expert_params(mlp.experts,
++                                                                num_local_experts,
++                                                                tp_size, mlp.config)
+         params_size = get_expert_param_size(mlp.experts, group_mlp_expert_params, 0)
+         params_type = get_expert_param_dtype(mlp.experts, group_mlp_expert_params, 0)
+ 
+-        input_paras_buffer = torch.zeros((mlp.experts.num_local_experts, params_size), 
++        input_paras_buffer = torch.zeros((num_local_experts, params_size),
+                                          dtype=params_type, device=torch.cuda.current_device())
+ 
+-        for i in range(mlp.experts.num_local_experts):
+-            get_expert_param_data(group_mlp_expert_params, input_paras_buffer[i], 
++        for i in range(num_local_experts):
++            get_expert_param_data(group_mlp_expert_params, input_paras_buffer[i],
+                                   mlp.new_local_expert_sorted_indices[i].item())
+         
+         #all2all communication and set paras     
+@@ -208,7 +741,7 @@ def expert_weight_placement(mlp):
+             mlp.output_splits_for_expert_placement,
+             mlp.input_splits_for_expert_placement,
+         )
+-        for idx in range(mlp.experts.num_local_experts):
++        for idx in range(num_local_experts):
+             set_expert_param_data(group_mlp_expert_params, 
+                                   output_paras_buffer[mlp.local_resorted_relative_mapping_indices[idx].item()], idx)
+ 
+@@ -229,24 +762,27 @@ def expert_bias_and_local_token_count_placement(mlp):
+         mlp.router.local_tokens_per_expert.data.copy_(reordered_tokens_data)
+ 
+ 
+-def get_bucket_param_placement_permission(optimizer, bucket):
+-    bucket_param_placement_permission = False
++def _iter_bucket_relocation_params(optimizer, bucket):
+     for param in bucket.params_list:
+-        if param in optimizer.params_module_mlp_map.keys() and \
+-                                            optimizer.params_module_mlp_map[param][0].expert_placement_layer_permission:
+-            bucket_param_placement_permission = True
+-            break
+-    return bucket_param_placement_permission
++        relocation_entry = _get_optimizer_expert_relocation_entry(
++            optimizer, bucket, param
++        )
++        if relocation_entry is not None:
++            mlp, name = relocation_entry
++            yield param, mlp, name
++
+ 
++def get_bucket_param_placement_permission(optimizer, bucket):
++    return any(True for _ in _iter_bucket_relocation_params(optimizer, bucket))
+ 
+-def relocate_expert_optimization_states(optimizer, reuse_fp32_param=True):
++
++def relocate_expert_optimization_states(optimizer, reuse_fp32_param=True, config=None):
+     '''
+     placement the states of optimizer provided the conditions are satified
+     ''' 
+-
+     pool = OptimizerStatePlacementMemoryPool()
+     for buffer in optimizer.buffers:
+-        for _, bucket in enumerate(buffer.buckets):
++        for bucket in buffer.buckets:
+             bucket_param_placement_permission = get_bucket_param_placement_permission(optimizer, bucket)
+ 
+             if not bucket_param_placement_permission:
+@@ -261,45 +797,57 @@ def relocate_expert_optimization_states(optimizer, reuse_fp32_param=True):
+                 all_gather_handle = _dispatch_gather_optimizer_states(optimizer, optbuf_view_items_dp, force_sync=False)
+                 optbuf_view_items_ep = _get_optimizer_state_buffer_ep_views(
+                                                             optimizer, buffer, bucket, optimizer_state_placement_memory)
+-                _dispatch_all2all_optimizer_states(optimizer, optbuf_view_items_ep)
++                _dispatch_all2all_optimizer_states(
++                    optimizer, optbuf_view_items_ep, config=config
++                )
+                 bidirectional_copy_bucket_optimizer_buffer_with_optimizer_res(
+                                         optimizer, bucket, optimizer_state_placement_memory, bucket_buffer_to_res=True)
++                pool.clear()
+ 
+             else:
+                 dtype = torch.float32
+                 optimizer_state_placement_memory = pool.get((bucket.param_data.nelement(),), dtype)
+                 bidirectional_copy_bucket_optimizer_buffer_with_optimizer_mainparam(
+-                                optimizer, bucket, optimizer_state_placement_memory, bucket_buffer_to_mainparam=False)
++                                optimizer, bucket, optimizer_state_placement_memory,
++                                bucket_buffer_to_mainparam=False, config=config)
+                 optbuf_view_items_dp = _get_optimizer_state_buffer_dp_views(optimizer, optimizer_state_placement_memory)
+                 all_gather_handle = _dispatch_gather_optimizer_states(optimizer, optbuf_view_items_dp, force_sync=False)
+                 optbuf_view_items_ep = _get_optimizer_state_buffer_ep_views(
+                                 optimizer, buffer, bucket, optimizer_state_placement_memory)
+-                _dispatch_all2all_optimizer_states(optimizer, optbuf_view_items_ep)
++                _dispatch_all2all_optimizer_states(
++                    optimizer, optbuf_view_items_ep, config=config
++                )
+                 bidirectional_copy_bucket_optimizer_buffer_with_optimizer_mainparam(
+-                                optimizer, bucket, optimizer_state_placement_memory, bucket_buffer_to_mainparam=True)
++                                optimizer, bucket, optimizer_state_placement_memory,
++                                bucket_buffer_to_mainparam=True, config=config)
++                pool.clear()
+ 
+             # relocate optimizer states
+             for key in ["exp_avg", "exp_avg_sq"]:
+                 dtype = torch.float32
+                 optimizer_state_placement_memory = pool.get((bucket.param_data.nelement(),), dtype)
+                 bidirectional_copy_bucket_optimizer_buffer_with_optimizer_states(
+-                                optimizer, bucket, optimizer_state_placement_memory, key, bucket_buffer_to_state=False)
++                                optimizer, bucket, optimizer_state_placement_memory, key,
++                                bucket_buffer_to_state=False, config=config)
+                 optbuf_view_items_dp = _get_optimizer_state_buffer_dp_views(optimizer, optimizer_state_placement_memory)
+                 all_gather_handle = _dispatch_gather_optimizer_states(optimizer, optbuf_view_items_dp, force_sync=False)
+                 optbuf_view_items_ep = _get_optimizer_state_buffer_ep_views(
+                                 optimizer, buffer, bucket, optimizer_state_placement_memory)
+-                _dispatch_all2all_optimizer_states(optimizer, optbuf_view_items_ep)
++                _dispatch_all2all_optimizer_states(
++                    optimizer, optbuf_view_items_ep, config=config
++                )
+                 bidirectional_copy_bucket_optimizer_buffer_with_optimizer_states(
+-                                optimizer, bucket, optimizer_state_placement_memory, key, bucket_buffer_to_state=True)
+-            
+-            pool.clear()
++                                optimizer, bucket, optimizer_state_placement_memory, key,
++                                bucket_buffer_to_state=True, config=config)
++                pool.clear()
+ 
+  
+ def bidirectional_copy_bucket_optimizer_buffer_with_optimizer_mainparam(
+     optimizer, 
+     bucket, 
+     optimizer_state_placement_memory, 
+-    bucket_buffer_to_mainparam=True):
++    bucket_buffer_to_mainparam=True,
++    config=None):
+     """
+     Copy main params to model params.
+  
+@@ -307,14 +855,15 @@ def bidirectional_copy_bucket_optimizer_buffer_with_optimizer_mainparam(
+     buffer, this method is responsible for copying the updated params
+     from the main shards into the correct position in the grad buffer.
+     """
++    runtime_config = config if config is not None else get_args()
++    swap_optimizer = getattr(runtime_config, "swap_optimizer", False)
++
+     def copy_group_params(shard_main_groups, model_groups, bucket_buffer_to_mainparam=True):
+         for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+             for shard_main_param, model_param in zip(shard_main_group, model_group):
+-                if not (
+-                    model_param in optimizer.params_module_mlp_map
+-                    and optimizer.params_module_mlp_map[model_param][0].expert_placement_layer_permission 
+-                    and model_param in bucket.params
+-                ):
++                if _get_optimizer_expert_relocation_entry(
++                    optimizer, bucket, model_param
++                ) is None:
+                     continue
+ 
+                 param_range_map = optimizer._get_model_param_range_map(model_param)
+@@ -324,7 +873,7 @@ def bidirectional_copy_bucket_optimizer_buffer_with_optimizer_mainparam(
+                     optimizer_state_placement_memory.view(-1)[world_range.start:world_range.end]
+                 )
+                 if (
+-                    getattr(get_args(), "swap_optimizer", False) 
++                    swap_optimizer
+                     and shard_main_param in optimizer.param_to_cpu_states_map
+                 ):
+                     candidate_main_param = optimizer.param_to_cpu_states_map[shard_main_param]['param']
+@@ -350,11 +899,9 @@ def bidirectional_copy_bucket_optimizer_buffer_with_optimizer_res(
+     # Utility method for copying group params.
+     for model_group in optimizer.model_float16_groups:
+         for model_param in model_group:
+-            if not (
+-                model_param in optimizer.params_module_mlp_map
+-                and optimizer.params_module_mlp_map[model_param][0].expert_placement_layer_permission 
+-                and model_param in bucket.params
+-            ):
++            if _get_optimizer_expert_relocation_entry(
++                optimizer, bucket, model_param
++            ) is None:
+                 continue
+ 
+             param_range_map = optimizer._get_model_param_range_map(model_param)
+@@ -388,16 +935,18 @@ def bidirectional_copy_bucket_optimizer_buffer_with_optimizer_states(
+     bucket, 
+     optimizer_state_placement_memory, 
+     key, 
+-    bucket_buffer_to_state=True):
++    bucket_buffer_to_state=True,
++    config=None):
+     # Utility method for copying group params.
++    runtime_config = config if config is not None else get_args()
++    swap_optimizer = getattr(runtime_config, "swap_optimizer", False)
++
+     def copy_group_params(model_groups, key, bucket_buffer_to_state=True):
+         for model_group in model_groups:
+             for model_param in model_group:
+-                if not (
+-                    model_param in optimizer.params_module_mlp_map.keys() 
+-                    and optimizer.params_module_mlp_map[model_param][0].expert_placement_layer_permission 
+-                    and model_param in bucket.params
+-                ):
++                if _get_optimizer_expert_relocation_entry(
++                    optimizer, bucket, model_param
++                ) is None:
+                     continue
+                 
+                 param_range_map = optimizer._get_model_param_range_map(model_param)
+@@ -410,7 +959,7 @@ def bidirectional_copy_bucket_optimizer_buffer_with_optimizer_states(
+                 group_index, group_order = optimizer.model_param_group_index_map[model_param]
+                 main_param = optimizer.optimizer.param_groups[group_index]["params"][group_order]
+                 if key in optimizer.optimizer.state[main_param].keys():
+-                    if getattr(get_args(), "swap_optimizer", False) and main_param in optimizer.param_to_cpu_states_map:
++                    if swap_optimizer and main_param in optimizer.param_to_cpu_states_map:
+                         candidate_optimizer_state = optimizer.param_to_cpu_states_map[main_param][key]
+                     else:
+                         candidate_optimizer_state = optimizer.optimizer.state[main_param][key]
+@@ -501,59 +1050,131 @@ def _get_optimizer_state_buffer_ep_views(optimizer, buffer, bucket, optimizer_st
+     """
+  
+     view_items = []
++    te_grouped_param_items = {}
+     for _, param in enumerate(bucket.params_list):
+-        if not (
+-            param in optimizer.params_module_mlp_map
+-            and optimizer.params_module_mlp_map[param][0].expert_placement_layer_permission 
+-            and param in bucket.params
+-        ):
++        relocation_entry = _get_optimizer_expert_relocation_entry(
++            optimizer, bucket, param
++        )
++        if relocation_entry is None:
+             continue
++        mlp, param_name = relocation_entry
+ 
+         param_world_start_index, param_world_end_index, _ = buffer.param_index_map[param]
+         param_bucket_start_index = param_world_start_index - bucket.offset
+         param_bucket_end_index = param_world_end_index - bucket.offset
+         param_optimizer_data = optimizer_state_placement_memory[param_bucket_start_index:param_bucket_end_index]
+ 
+-        if ".mlp.router" in optimizer.params_module_mlp_map[param][1]:
++        input_splits = mlp.input_splits_for_expert_placement
++        output_splits = mlp.output_splits_for_expert_placement
++        local_resorted_relative_mapping_indices = (
++            mlp.local_resorted_relative_mapping_indices
++        )
++        new_local_expert_sorted_indices = mlp.new_local_expert_sorted_indices
++        num_local_experts = _get_local_expert_count(mlp)
++
++        if _is_router_optimizer_relocation_param(param_name):
+             param_optimizer_data_reshape = param_optimizer_data.view(
+-                torch.Size([optimizer.params_module_mlp_map[param][0].config.num_moe_experts, -1])
++                torch.Size([mlp.config.num_moe_experts, -1])
+             )
+-            inverse_expert_mapping = torch.argsort(optimizer.params_module_mlp_map[param][0].relative_mapping)
+-            param_optimizer_data_reshape.copy_(param_optimizer_data_reshape[inverse_expert_mapping])
+-        else:
+-            input_splits = None
+-            output_splits = None
+-            local_resorted_relative_mapping_indices = None
+-            new_local_expert_sorted_indices = None
+-            input_splits = optimizer.params_module_mlp_map[param][0].input_splits_for_expert_placement
+-            output_splits = optimizer.params_module_mlp_map[param][0].output_splits_for_expert_placement
+-            local_resorted_relative_mapping_indices = (
+-                optimizer.params_module_mlp_map[param][0].local_resorted_relative_mapping_indices
++            inverse_expert_mapping = torch.argsort(mlp.relative_mapping)
++            param_optimizer_data_reshape.copy_(
++                param_optimizer_data_reshape[inverse_expert_mapping]
+             )
+-            new_local_expert_sorted_indices = optimizer.params_module_mlp_map[param][0].new_local_expert_sorted_indices
+-            
+-            num_local_experts = optimizer.params_module_mlp_map[param][0].experts.num_local_experts
+-            numele_per_expert = int((param_bucket_end_index - param_bucket_start_index) / num_local_experts)
++            continue
+ 
+-            param_optimizer_data_reshape = param_optimizer_data.view(
+-                torch.Size([num_local_experts, numele_per_expert])
++        if _is_te_grouped_expert_optimizer_param(param_name):
++            slot, group_name = _get_te_grouped_expert_param_slot_and_group_name(param_name)
++            if slot is None or slot >= num_local_experts:
++                raise ValueError(
++                    f"invalid TE grouped expert optimizer param name: {param_name}"
++                )
++            group_key = (id(mlp), group_name)
++            group_item = te_grouped_param_items.setdefault(
++                group_key,
++                {
++                    "mlp": mlp,
++                    "param_name": group_name,
++                    "rows": {},
++                    "numele_per_expert": None,
++                    "input_splits": input_splits,
++                    "output_splits": output_splits,
++                    "local_resorted_relative_mapping_indices": (
++                        local_resorted_relative_mapping_indices
++                    ),
++                    "new_local_expert_sorted_indices": new_local_expert_sorted_indices,
++                },
+             )
+-
+-            view_items.insert(
+-                0, 
+-                (param_optimizer_data_reshape,
+-                 input_splits, 
+-                 output_splits, 
+-                 local_resorted_relative_mapping_indices, 
+-                 new_local_expert_sorted_indices, 
+-                 optimizer.params_module_mlp_map[param][1]
++            numele_per_expert = param_optimizer_data.numel()
++            if group_item["numele_per_expert"] is None:
++                group_item["numele_per_expert"] = numele_per_expert
++            elif group_item["numele_per_expert"] != numele_per_expert:
++                raise ValueError(
++                    f"TE grouped expert optimizer params have inconsistent sizes: {group_name}"
++                )
++            if slot in group_item["rows"]:
++                raise ValueError(
++                    f"duplicate TE grouped expert optimizer param slot {slot}: {param_name}"
+                 )
++            group_item["rows"][slot] = param_optimizer_data.view(-1)
++            continue
++
++        numele_per_expert = int(
++            (param_bucket_end_index - param_bucket_start_index) / num_local_experts
++        )
++        param_optimizer_data_reshape = param_optimizer_data.view(
++            torch.Size([num_local_experts, numele_per_expert])
++        )
++        view_items.insert(
++            0,
++            (
++                param_optimizer_data_reshape,
++                input_splits,
++                output_splits,
++                local_resorted_relative_mapping_indices,
++                new_local_expert_sorted_indices,
++                param_name,
++                None,
++            )
++        )
++
++    for group_item in te_grouped_param_items.values():
++        mlp = group_item["mlp"]
++        num_local_experts = _get_local_expert_count(mlp)
++        if len(group_item["rows"]) != num_local_experts:
++            raise ValueError(
++                "TE grouped expert optimizer params for "
++                f"{group_item['param_name']} must be in the same bucket; "
++                f"got {len(group_item['rows'])}/{num_local_experts}"
+             )
++        first_row = group_item["rows"][0]
++        compact_optimizer_data = torch.empty(
++            (num_local_experts, group_item["numele_per_expert"]),
++            dtype=first_row.dtype,
++            device=first_row.device,
++        )
++        scatter_rows = []
++        for slot in range(num_local_experts):
++            row = group_item["rows"][slot]
++            compact_optimizer_data[slot].copy_(row)
++            scatter_rows.append((slot, row))
++        view_items.insert(
++            0,
++            (
++                compact_optimizer_data,
++                group_item["input_splits"],
++                group_item["output_splits"],
++                group_item["local_resorted_relative_mapping_indices"],
++                group_item["new_local_expert_sorted_indices"],
++                group_item["param_name"],
++                scatter_rows,
++            )
++        )
++
+     view_items_sorted = sorted(view_items, key=lambda x: x[5])
+     return view_items_sorted
+  
+  
+-def _dispatch_all2all_optimizer_states(optimizer, optbuf_view_items_ep):
++def _dispatch_all2all_optimizer_states(optimizer, optbuf_view_items_ep, config=None):
+     """
+     all2all updated optimizer states.
+  
+@@ -561,26 +1182,33 @@ def _dispatch_all2all_optimizer_states(optimizer, optbuf_view_items_ep):
+     buffer (see mcore/distributed/param_and_grad_buffer.py for details), and so the
+     all2all will put the results in the right region of memory.
+     """
++    runtime_config = config if config is not None else get_args()
+     for optbuf_view_item in optbuf_view_items_ep:
+         (
+             param_optimizer_data_reshape, 
+             input_splits, output_splits, 
+             local_resorted_relative_mapping_indices, 
+             new_local_expert_sorted_indices, 
+-            param_name
++            param_name,
++            scatter_rows,
+         ) = optbuf_view_item
+         if param_optimizer_data_reshape is not None:
+-            global_args = get_args()
+-            if global_args.moe_tp_extend_ep:
++            if getattr(runtime_config, "moe_tp_extend_ep", False):
+                 optimizer_state_placement_group = parallel_state.get_tensor_and_expert_parallel_group()
+             else:
+                 optimizer_state_placement_group = parallel_state.get_expert_model_parallel_group()
+  
+             param_optimizer_data_relocate = tensor_parallel.all_to_all(
+                 optimizer_state_placement_group,
+-                param_optimizer_data_reshape[new_local_expert_sorted_indices], 
++                param_optimizer_data_reshape[new_local_expert_sorted_indices],
+                 output_splits, 
+                 input_splits
+             )
+-            param_optimizer_data_reshape.copy_(param_optimizer_data_relocate[local_resorted_relative_mapping_indices])
+-
++            param_optimizer_data_output = param_optimizer_data_relocate[
++                local_resorted_relative_mapping_indices
++            ]
++            if scatter_rows is None:
++                param_optimizer_data_reshape.copy_(param_optimizer_data_output)
++            else:
++                for slot, row in scatter_rows:
++                    row.copy_(param_optimizer_data_output[slot].view_as(row))
+diff --git a/mindspeed/core/transformer/moe/expert_placement/planner.py b/mindspeed/core/transformer/moe/expert_placement/planner.py
+index 0a9ff8ff..66f992c3 100644
+--- a/mindspeed/core/transformer/moe/expert_placement/planner.py
++++ b/mindspeed/core/transformer/moe/expert_placement/planner.py
+@@ -16,7 +16,7 @@ def expert_placement_init(self, ep_size):
+         self.input_splits_for_expert_placement = np.zeros(self.ep_world_size, dtype=np.int32)
+         self.output_splits_for_expert_placement = np.zeros(self.ep_world_size, dtype=np.int32)
+ 
+-        self.local_resorted_relative_mapping_indices = torch.zeros(self.experts.num_local_experts, 
++        self.local_resorted_relative_mapping_indices = torch.zeros(self.experts.num_local_experts,
+                                                                    dtype=torch.int, device=torch.cuda.current_device())
+         self.new_local_expert_sorted_indices = torch.zeros(self.experts.num_local_experts, 
+                                                            dtype=torch.int, device=torch.cuda.current_device())
+diff --git a/mindspeed/core/transformer/moe/grouped_matmul_util.py b/mindspeed/core/transformer/moe/grouped_matmul_util.py
+index 52900aff..645fe60d 100644
+--- a/mindspeed/core/transformer/moe/grouped_matmul_util.py
++++ b/mindspeed/core/transformer/moe/grouped_matmul_util.py
+@@ -12,7 +12,7 @@ from mindspeed.te.pytorch.utils import get_quant_dtype
+ 
+ def get_gmm_quant_func() -> Type['BaseGMMFunction'] | None:
+     args = get_args()
+-    if not args.fp8 or not args.use_gmm_fp8:
++    if not getattr(args, "fp8", False) or not getattr(args, "use_gmm_fp8", False):
+         return None
+     if args.fp8_recipe == Fp8Recipe.mxfp8:
+         return MXFP8GMMFunction
+diff --git a/mindspeed/core/transformer/moe/moe_feature/fb_overlap/modules/weight_grad_store.py b/mindspeed/core/transformer/moe/moe_feature/fb_overlap/modules/weight_grad_store.py
+index 03109f1a..d2472c53 100644
+--- a/mindspeed/core/transformer/moe/moe_feature/fb_overlap/modules/weight_grad_store.py
++++ b/mindspeed/core/transformer/moe/moe_feature/fb_overlap/modules/weight_grad_store.py
+@@ -86,7 +86,7 @@ class WeightGradStore:
+             if get_args().gemm_gradient_accumulation_fusion and not getattr(weight, 'is_hot_experts', False):
+                 npu_groupmatmul_add_fp32(inputs, grad_output, group_list, weight.main_grad)
+             else:
+-                if args.fp8 and args.use_gmm_fp8:
++                if getattr(args, "fp8", False) and getattr(args, "use_gmm_fp8", False):
+                     from mindspeed.core.transformer.moe.grouped_matmul_util import get_gmm_op_cls
+                     grad_weight = get_gmm_op_cls().op_dw(inputs, grad_output, group_list, group_list_type)[0]
+                 else:
+diff --git a/mindspeed/core/transformer/moe/moe_feature/tp_extend_ep/moe_layer.py b/mindspeed/core/transformer/moe/moe_feature/tp_extend_ep/moe_layer.py
+index 476aebf3..ca6d5bbd 100644
+--- a/mindspeed/core/transformer/moe/moe_feature/tp_extend_ep/moe_layer.py
++++ b/mindspeed/core/transformer/moe/moe_feature/tp_extend_ep/moe_layer.py
+@@ -135,4 +135,3 @@ class All2AllSeqTpExtendEpMoELayerImpl(MSBaseMoELayer):
+             output, mlp_bias = custom_forward(hidden_states)
+ 
+         return output, mlp_bias
+-
+diff --git a/mindspeed/core/transformer/moe/moe_utils.py b/mindspeed/core/transformer/moe/moe_utils.py
+index 0b9af2c5..d361e567 100644
+--- a/mindspeed/core/transformer/moe/moe_utils.py
++++ b/mindspeed/core/transformer/moe/moe_utils.py
+@@ -307,6 +307,18 @@ def track_moe_metrics(
+ 
+ 
+ def get_grouped_expert_params(model, num_local_experts, tp_size, config):
++    if not hasattr(model, "weight1") and hasattr(model, "linear_fc1"):
++        group_mlp_expert_params = {}
++        for idx in range(num_local_experts):
++            expert_weight1 = getattr(model.linear_fc1, f"weight{idx}")
++            expert_weight2 = getattr(model.linear_fc2, f"weight{idx}")
++            group_mlp_expert_params[idx] = {
++                'weight1': expert_weight1,
++                'weight2': expert_weight2,
++                'total_params': expert_weight1.numel() + expert_weight2.numel()
++            }
++        return group_mlp_expert_params
++
+     hidden_size = config.hidden_size
+     ffn_hidden_size = config.moe_ffn_hidden_size
+     
+diff --git a/mindspeed/features_manager/moe/experts_placement.py b/mindspeed/features_manager/moe/experts_placement.py
+index b61cc4e9..2941bb06 100644
+--- a/mindspeed/features_manager/moe/experts_placement.py
++++ b/mindspeed/features_manager/moe/experts_placement.py
+@@ -17,13 +17,40 @@ class ExpertsPlacementFeature(MindSpeedFeature):
+             help='define the fix frequency of expert placement')
+         group.add_argument('--enable-fine-grained-expert-placement', action='store_true',
+             help='balance the experts load within ep group.')
++        group.add_argument('--enable-external-expert-placement', action='store_true',
++            help='allow an external caller to apply an expert placement strategy.')
+         group.add_argument("--print-expert-load", action='store_true',
+             help="print tokens of each expert in each layer of each stage in dp 0")
+         group.add_argument('--fine-grained-expert-placement-thre', type=float, default=0.08,
+             help='define the fix frequency of expert placement')
+     
+     def validate_args(self, args):
++        """Validate expert placement feature dependencies and exclusions.
++
++        Args:
++            args: Parsed training arguments.
++
++        Raises:
++            AssertionError: If external expert placement uses unsupported options.
++        """
+         # expert placement check
++        if getattr(args, "enable_external_expert_placement", False):
++            if getattr(args, "enable_expert_placement", False):
++                raise AssertionError(
++                    '`--enable-external-expert-placement` cannot be used with `--enable-expert-placement`.'
++                )
++            if not getattr(args, "use_distributed_optimizer", False):
++                raise AssertionError(
++                    '`--enable-external-expert-placement` requires `--use-distributed-optimizer`.'
++                )
++            if getattr(args, "moe_extended_tp", False):
++                raise AssertionError(
++                    '`--enable-external-expert-placement` does not support `--moe-extended-tp`.'
++                )
++            if getattr(args, "moe_tp_extend_ep", False):
++                raise AssertionError(
++                    '`--enable-external-expert-placement` does not support `--moe-tp-extend-ep`.'
++                )
+         if getattr(args, "enable_expert_placement", False):
+             if not args.use_distributed_optimizer:
+                 print('--enable_expert_placement only supported with distributed optimizer')
+@@ -42,8 +69,13 @@ class ExpertsPlacementFeature(MindSpeedFeature):
+ 
+     def register_patches(self, patch_manager, args):
+         if getattr(args, "enable_expert_placement", False) or getattr(args, "print_expert_load", False): 
+-            from mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.moe_layer import MindSpeedFbOverlapMoELayer
+-            from mindspeed.core.transformer.moe.expert_placement.planner import expert_placement_init, predict_expert_load
++            from mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.moe_layer import (
++                MindSpeedFbOverlapMoELayer,
++            )
++            from mindspeed.core.transformer.moe.expert_placement.planner import (
++                expert_placement_init,
++                predict_expert_load,
++            )
+             MindSpeedFbOverlapMoELayer.expert_placement_init = expert_placement_init
+             MindSpeedFbOverlapMoELayer.predict_expert_load = predict_expert_load
+             
+diff --git a/tests_extend/unit_tests/mindspeed/core/transformer/moe/test_external_expert_placement.py b/tests_extend/unit_tests/mindspeed/core/transformer/moe/test_external_expert_placement.py
+new file mode 100644
+index 00000000..df9a9d28
+--- /dev/null
++++ b/tests_extend/unit_tests/mindspeed/core/transformer/moe/test_external_expert_placement.py
+@@ -0,0 +1,682 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from mindspeed.core.transformer.moe.expert_placement import executor
++from mindspeed.core.transformer.moe.moe_utils import get_grouped_expert_params
++from mindspeed.features_manager.moe.experts_placement import ExpertsPlacementFeature
++
++
++def _make_mlp():
++    config = SimpleNamespace(
++        num_moe_experts=4,
++        num_experts=None,
++        moe_tp_extend_ep=False,
++        moe_grouped_gemm=False,
++    )
++    experts = SimpleNamespace(
++        num_local_experts=2,
++        weight1=torch.empty(1),
++    )
++    return SimpleNamespace(config=config, experts=experts, router=SimpleNamespace())
++
++
++def _make_te_grouped_mlp():
++    config = SimpleNamespace(
++        num_moe_experts=4,
++        num_experts=None,
++        moe_tp_extend_ep=False,
++        moe_grouped_gemm=True,
++    )
++    experts = SimpleNamespace(
++        num_local_experts=2,
++        linear_fc1=SimpleNamespace(
++            weight0=torch.empty(1),
++            weight1=torch.empty(1),
++        ),
++        linear_fc2=SimpleNamespace(
++            weight0=torch.empty(1),
++            weight1=torch.empty(1),
++        ),
++    )
++    return SimpleNamespace(config=config, experts=experts, router=SimpleNamespace())
++
++
++def _make_model(mlp):
++    layer = SimpleNamespace(layer_number=1, mlp=mlp)
++    decoder = SimpleNamespace(layers=[layer])
++    module = SimpleNamespace(decoder=decoder)
++    return [SimpleNamespace(module=SimpleNamespace(module=module))]
++
++
++def _make_relocate_args(**overrides):
++    args = {
++        "enable_external_expert_placement": True,
++        "enable_expert_placement": False,
++        "use_distributed_optimizer": True,
++        "moe_extended_tp": False,
++        "moe_tp_extend_ep": False,
++        "enable_fine_grained_expert_placement": False,
++    }
++    args.update(overrides)
++    return SimpleNamespace(**args)
++
++
++def test_external_placement_validate_args_accepts_supported_config():
++    ExpertsPlacementFeature().validate_args(_make_relocate_args())
++
++
++def test_native_placement_validate_args_keeps_tp_extend_ep():
++    ExpertsPlacementFeature().validate_args(
++        _make_relocate_args(
++            enable_external_expert_placement=False,
++            enable_expert_placement=True,
++            moe_tp_extend_ep=True,
++            expert_model_parallel_size=2,
++            expert_placement_freq=50,
++        )
++    )
++
++
++@pytest.mark.parametrize(
++    ("overrides", "message"),
++    [
++        ({"enable_expert_placement": True}, "--enable-expert-placement"),
++        ({"use_distributed_optimizer": False}, "--use-distributed-optimizer"),
++        ({"moe_extended_tp": True}, "--moe-extended-tp"),
++        ({"moe_tp_extend_ep": True}, "--moe-tp-extend-ep"),
++    ],
++)
++def test_external_placement_validate_args_rejects_unsupported_config(
++    overrides, message
++):
++    with pytest.raises(AssertionError, match=message):
++        ExpertsPlacementFeature().validate_args(_make_relocate_args(**overrides))
++
++
++def test_external_placement_builds_logical_to_physical_mapping(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++
++    placement = executor._normalize_placement(
++        {
++            "0": {
++                "0": [0, 3],
++                "1": [1, 2],
++            }
++        }
++    )
++    mappings = executor._validate_and_build_external_mappings(placement, {0: mlp})
++
++    assert mappings[0].tolist() == [0, 2, 3, 1]
++
++
++def test_external_placement_rejects_legacy_grouped_mlp(monkeypatch):
++    mlp = _make_mlp()
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++
++    with pytest.raises(ValueError, match="TEGroupedMLP"):
++        executor._validate_and_build_external_mappings(
++            {
++                0: {
++                    0: [0, 1],
++                    1: [2, 3],
++                }
++            },
++            {0: mlp},
++        )
++
++
++def test_build_optimizer_mlp_map_keeps_native_params_and_accepts_te():
++    mlp = _make_mlp()
++    expert_param = torch.nn.Parameter(torch.empty(1))
++    te_expert_param = torch.nn.Parameter(torch.empty(1))
++    router_param = torch.nn.Parameter(torch.empty(1))
++
++    class ModelChunk:
++        def __init__(self):
++            decoder = SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)])
++            self.module = SimpleNamespace(
++                module=SimpleNamespace(decoder=decoder)
++            )
++
++        def named_parameters(self):
++            return iter(
++                [
++                    (
++                        "module.module.decoder.layers.0.mlp.experts.weight1",
++                        expert_param,
++                    ),
++                    (
++                        "module.module.decoder.layers.0.mlp.experts.linear_fc1.weight0",
++                        te_expert_param,
++                    ),
++                    (
++                        "module.module.decoder.layers.0.mlp.router.weight",
++                        router_param,
++                    ),
++                ]
++            )
++
++    mapping = executor.build_param_params_module_mlp_map([ModelChunk()])
++
++    assert expert_param in mapping
++    assert router_param in mapping
++    assert te_expert_param in mapping
++
++
++def test_set_optimizer_mlp_map_for_external_keeps_only_te_params():
++    mlp = _make_mlp()
++    expert_param = torch.nn.Parameter(torch.empty(1))
++    te_expert_param = torch.nn.Parameter(torch.empty(1))
++    router_param = torch.nn.Parameter(torch.empty(1))
++    shared_expert_param = torch.nn.Parameter(torch.empty(1))
++    optimizer = SimpleNamespace()
++
++    class ModelChunk:
++        def __init__(self):
++            decoder = SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)])
++            self.module = SimpleNamespace(
++                module=SimpleNamespace(decoder=decoder)
++            )
++
++        def named_parameters(self):
++            return iter(
++                [
++                    (
++                        "module.module.decoder.layers.0.mlp.experts.weight1",
++                        expert_param,
++                    ),
++                    (
++                        "module.module.decoder.layers.0.mlp.experts.linear_fc1.weight0",
++                        te_expert_param,
++                    ),
++                    (
++                        "module.module.decoder.layers.0.mlp.router.weight",
++                        router_param,
++                    ),
++                    (
++                        "module.module.decoder.layers.0.mlp.shared_experts.linear_fc1.weight",
++                        shared_expert_param,
++                    ),
++                ]
++            )
++
++    optimizers = executor._set_optimizer_mlp_map([ModelChunk()], optimizer)
++    mapping = optimizer.params_module_mlp_map
++
++    assert optimizers == [optimizer]
++    assert expert_param not in mapping
++    assert te_expert_param in mapping
++    assert router_param not in mapping
++    assert shared_expert_param not in mapping
++
++
++def test_optimizer_ep_views_group_te_params_by_slot():
++    mlp = _make_te_grouped_mlp()
++    mlp.expert_placement_layer_permission = True
++    mlp.input_splits_for_expert_placement = [1, 1]
++    mlp.output_splits_for_expert_placement = [1, 1]
++    mlp.local_resorted_relative_mapping_indices = torch.tensor([0, 1])
++    mlp.new_local_expert_sorted_indices = torch.tensor([0, 1])
++    param0 = torch.nn.Parameter(torch.empty(2))
++    param1 = torch.nn.Parameter(torch.empty(2))
++    bucket = SimpleNamespace(
++        params_list=[param0, param1],
++        params={param0, param1},
++        offset=0,
++    )
++    buffer = SimpleNamespace(
++        param_index_map={
++            param0: (0, 2, None),
++            param1: (2, 4, None),
++        }
++    )
++    optimizer = SimpleNamespace(
++        params_module_mlp_map={
++            param0: [mlp, "decoder.layers.0.mlp.experts.linear_fc1.weight0"],
++            param1: [mlp, "decoder.layers.0.mlp.experts.linear_fc1.weight1"],
++        }
++    )
++    optimizer_state_placement_memory = torch.tensor(
++        [10.0, 11.0, 20.0, 21.0]
++    )
++
++    view_items = executor._get_optimizer_state_buffer_ep_views(
++        optimizer, buffer, bucket, optimizer_state_placement_memory
++    )
++
++    assert len(view_items) == 1
++    assert view_items[0][0].tolist() == [[10.0, 11.0], [20.0, 21.0]]
++    assert view_items[0][6][0][1].data_ptr() == optimizer_state_placement_memory[0:2].data_ptr()
++    assert view_items[0][6][1][1].data_ptr() == optimizer_state_placement_memory[2:4].data_ptr()
++
++
++def test_dispatch_all2all_scatter_te_grouped_optimizer_views(monkeypatch):
++    row0 = torch.zeros(2)
++    row1 = torch.zeros(2)
++    compact = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
++    group = object()
++
++    monkeypatch.setattr(
++        executor.parallel_state,
++        "get_expert_model_parallel_group",
++        lambda: group,
++    )
++    monkeypatch.setattr(
++        executor,
++        "get_args",
++        lambda: (_ for _ in ()).throw(AssertionError("global args must not be used")),
++    )
++
++    def fake_all_to_all(target_group, tensor, output_splits, input_splits):
++        assert target_group is group
++        assert output_splits == [1, 1]
++        assert input_splits == [1, 1]
++        return tensor + 10.0
++
++    monkeypatch.setattr(executor.tensor_parallel, "all_to_all", fake_all_to_all)
++
++    executor._dispatch_all2all_optimizer_states(
++        SimpleNamespace(),
++        [
++            (
++                compact,
++                [1, 1],
++                [1, 1],
++                torch.tensor([1, 0]),
++                torch.tensor([0, 1]),
++                "decoder.layers.0.mlp.experts.linear_fc1.weight",
++                [(0, row0), (1, row1)],
++            )
++        ],
++        config=SimpleNamespace(moe_tp_extend_ep=False),
++    )
++
++    assert row0.tolist() == [13.0, 14.0]
++    assert row1.tolist() == [11.0, 12.0]
++
++
++def test_relocate_optimizer_states_forwards_explicit_config(monkeypatch):
++    config = SimpleNamespace(moe_tp_extend_ep=False, swap_optimizer=False)
++    bucket = SimpleNamespace(param_data=torch.empty(4))
++    optimizer = SimpleNamespace(
++        buffers=[SimpleNamespace(buckets=[bucket])],
++    )
++    calls = []
++
++    class FakePool:
++        def get(self, shape, dtype):
++            return torch.empty(shape, dtype=dtype)
++
++        def clear(self):
++            pass
++
++    monkeypatch.setattr(executor, "OptimizerStatePlacementMemoryPool", FakePool)
++    monkeypatch.setattr(
++        executor, "get_bucket_param_placement_permission", lambda *_: True
++    )
++    monkeypatch.setattr(
++        executor,
++        "bidirectional_copy_bucket_optimizer_buffer_with_optimizer_mainparam",
++        lambda _optimizer, _bucket, _memory, bucket_buffer_to_mainparam=True,
++        config=None: calls.append(("main", bucket_buffer_to_mainparam, config)),
++    )
++    monkeypatch.setattr(
++        executor,
++        "bidirectional_copy_bucket_optimizer_buffer_with_optimizer_states",
++        lambda _optimizer, _bucket, _memory, key, bucket_buffer_to_state=True,
++        config=None: calls.append(("state", key, bucket_buffer_to_state, config)),
++    )
++    monkeypatch.setattr(
++        executor, "_get_optimizer_state_buffer_dp_views", lambda *_: []
++    )
++    monkeypatch.setattr(
++        executor, "_dispatch_gather_optimizer_states", lambda *_, **__: None
++    )
++    monkeypatch.setattr(
++        executor, "_get_optimizer_state_buffer_ep_views", lambda *_: []
++    )
++    monkeypatch.setattr(
++        executor,
++        "_dispatch_all2all_optimizer_states",
++        lambda _optimizer, _views, config=None: calls.append(("dispatch", config)),
++    )
++
++    executor.relocate_expert_optimization_states(
++        optimizer,
++        reuse_fp32_param=False,
++        config=config,
++    )
++
++    assert calls == [
++        ("main", False, config),
++        ("dispatch", config),
++        ("main", True, config),
++        ("state", "exp_avg", False, config),
++        ("dispatch", config),
++        ("state", "exp_avg", True, config),
++        ("state", "exp_avg_sq", False, config),
++        ("dispatch", config),
++        ("state", "exp_avg_sq", True, config),
++    ]
++
++
++def test_external_placement_rejects_duplicate_experts(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++    placement = {
++        0: {
++            0: [0, 1],
++            1: [1, 3],
++        }
++    }
++
++    with pytest.raises(ValueError, match="exactly once"):
++        executor._validate_and_build_external_mappings(placement, {0: mlp})
++
++
++def test_external_placement_rejects_tp_extend_ep():
++    mlp = _make_te_grouped_mlp()
++    mlp.config.moe_tp_extend_ep = True
++    result = executor.set_expert_placement(
++        _make_model(mlp),
++        SimpleNamespace(),
++        {
++            0: {
++                0: [0, 1],
++                1: [2, 3],
++            }
++        },
++        strategy_version=1,
++        config=SimpleNamespace(enable_external_expert_placement=True),
++    )
++
++    assert result["success"] is False
++    assert "--moe-tp-extend-ep" in result["message"]
++
++
++def test_external_placement_accepts_te_grouped_mlp_without_weight1(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++
++    mappings = executor._validate_and_build_external_mappings(
++        {
++            0: {
++                0: [0, 1],
++                1: [2, 3],
++            }
++        },
++        {0: mlp},
++    )
++    executor._ensure_external_placement_state(mlp)
++
++    assert mappings[0].device == mlp.experts.linear_fc1.weight0.device
++    assert mlp.expert_mapping.device == mlp.experts.linear_fc1.weight0.device
++
++
++def test_external_dispatcher_uses_layer_config_without_global_args(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_rank", lambda: 0
++    )
++    monkeypatch.setattr(
++        executor,
++        "get_args",
++        lambda: (_ for _ in ()).throw(AssertionError("global args must not be used")),
++    )
++    monkeypatch.setattr(
++        executor.torch,
++        "histc",
++        lambda *_args, **_kwargs: torch.tensor([1.0, 1.0]),
++    )
++    executor._ensure_external_placement_state(mlp)
++    target_mapping = torch.tensor([0, 2, 3, 1], dtype=torch.int)
++
++    executor.initialize_expert_placement_dispatcher(mlp, target_mapping)
++
++    assert mlp.expert_mapping.tolist() == target_mapping.tolist()
++    assert mlp.input_splits_for_expert_placement.tolist() == [1.0, 1.0]
++    assert mlp.output_splits_for_expert_placement.tolist() == [1, 1]
++
++
++def test_get_grouped_expert_params_accepts_te_grouped_mlp_weights():
++    mlp = _make_te_grouped_mlp()
++
++    params = get_grouped_expert_params(
++        mlp.experts,
++        num_local_experts=2,
++        tp_size=1,
++        config=mlp.config,
++    )
++
++    assert params[0]["weight1"] is mlp.experts.linear_fc1.weight0
++    assert params[0]["weight2"] is mlp.experts.linear_fc2.weight0
++    assert params[1]["weight1"] is mlp.experts.linear_fc1.weight1
++    assert params[1]["weight2"] is mlp.experts.linear_fc2.weight1
++
++
++def test_set_expert_placement_skips_unchanged_strategy(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    model = _make_model(mlp)
++    optimizer = SimpleNamespace()
++    args = SimpleNamespace(
++        enable_external_expert_placement=True,
++    )
++    monkeypatch.setattr(executor, "get_args", lambda: args)
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++    monkeypatch.setattr(
++        executor,
++        "expert_weight_placement",
++        lambda _: pytest.fail("no-op strategy must not migrate weights"),
++    )
++
++    result = executor.set_expert_placement(
++        model,
++        optimizer,
++        {
++            0: {
++                0: [0, 1],
++                1: [2, 3],
++            }
++        },
++        strategy_version=1,
++    )
++
++    assert result == {
++        "success": True,
++        "changed": False,
++        "strategy_version": 1,
++        "changed_layers": [],
++        "message": "expert placement is unchanged",
++    }
++    assert mlp.external_expert_placement_version == 1
++
++
++def test_set_expert_placement_reuses_existing_executors(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    model = _make_model(mlp)
++    optimizer = SimpleNamespace()
++    args = SimpleNamespace(
++        enable_external_expert_placement=True,
++        reuse_fp32_param=True,
++    )
++    calls = []
++
++    monkeypatch.setattr(executor, "get_args", lambda: args)
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++
++    def fake_initialize(target_mlp, target_mapping):
++        target_mlp.expert_mapping.copy_(target_mapping)
++        target_mlp.expert_placement_layer_permission = True
++        calls.append("plan")
++
++    monkeypatch.setattr(
++        executor, "initialize_expert_placement_dispatcher", fake_initialize
++    )
++    monkeypatch.setattr(
++        executor, "expert_weight_placement", lambda _mlp: calls.append("weight")
++    )
++    monkeypatch.setattr(
++        executor, "_set_optimizer_mlp_map", lambda _model, opt: [opt]
++    )
++    monkeypatch.setattr(
++        executor,
++        "relocate_expert_optimization_states",
++        lambda _optimizer, reuse_fp32_param, config=None: calls.append(
++            ("optimizer", reuse_fp32_param)
++        ),
++    )
++    monkeypatch.setattr(executor, "print_rank_0", lambda *_: None)
++
++    result = executor.set_expert_placement(
++        model,
++        optimizer,
++        {
++            0: {
++                0: [0, 2],
++                1: [1, 3],
++            }
++        },
++        strategy_version=2,
++    )
++
++    assert result["success"] is True
++    assert result["changed"] is True
++    assert result["changed_layers"] == [0]
++    assert calls == ["plan", "weight", ("optimizer", True)]
++    assert mlp.external_expert_placement_version == 2
++    assert mlp.expert_placement_layer_permission is False
++
++
++def test_set_expert_placement_uses_explicit_config_without_global_args(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    model = _make_model(mlp)
++    optimizer = SimpleNamespace()
++    config = SimpleNamespace(
++        enable_external_expert_placement=True,
++    )
++
++    monkeypatch.setattr(
++        executor,
++        "get_args",
++        lambda: (_ for _ in ()).throw(AssertionError("global args must not be used")),
++    )
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++    monkeypatch.setattr(
++        executor,
++        "expert_weight_placement",
++        lambda _: pytest.fail("no-op strategy must not migrate weights"),
++    )
++
++    result = executor.set_expert_placement(
++        model,
++        optimizer,
++        {
++            0: {
++                0: [0, 1],
++                1: [2, 3],
++            }
++        },
++        strategy_version=3,
++        config=config,
++    )
++
++    assert result["success"] is True
++    assert result["changed"] is False
++    assert mlp.external_expert_placement_version == 3
++
++
++def test_changed_placement_uses_explicit_config_for_optimizer_relocation(monkeypatch):
++    mlp = _make_te_grouped_mlp()
++    model = _make_model(mlp)
++    optimizer = SimpleNamespace(
++        config=SimpleNamespace(reuse_fp32_param=False),
++    )
++    config = SimpleNamespace(
++        enable_external_expert_placement=True,
++        reuse_fp32_param=True,
++        moe_tp_extend_ep=False,
++        swap_optimizer=False,
++    )
++    relocated = []
++
++    monkeypatch.setattr(
++        executor,
++        "get_args",
++        lambda: (_ for _ in ()).throw(AssertionError("global args must not be used")),
++    )
++    monkeypatch.setattr(
++        executor.parallel_state, "get_expert_model_parallel_world_size", lambda: 2
++    )
++
++    def fake_initialize(target_mlp, target_mapping):
++        target_mlp.expert_mapping.copy_(target_mapping)
++        target_mlp.expert_placement_layer_permission = True
++
++    monkeypatch.setattr(
++        executor, "initialize_expert_placement_dispatcher", fake_initialize
++    )
++    monkeypatch.setattr(executor, "expert_weight_placement", lambda _mlp: None)
++    monkeypatch.setattr(
++        executor, "_set_optimizer_mlp_map", lambda _model, opt: [opt]
++    )
++    monkeypatch.setattr(
++        executor,
++        "relocate_expert_optimization_states",
++        lambda _optimizer, reuse_fp32_param=True, config=None: relocated.append(
++            (reuse_fp32_param, config)
++        ),
++    )
++    monkeypatch.setattr(executor, "print_rank_0", lambda *_: None)
++
++    result = executor.set_expert_placement(
++        model,
++        optimizer,
++        {
++            0: {
++                0: [0, 2],
++                1: [1, 3],
++            }
++        },
++        strategy_version=4,
++        config=config,
++    )
++
++    assert result["success"] is True
++    assert result["changed"] is True
++    assert relocated == [(False, config)]
++
++
++def test_external_placement_requires_explicit_enable(monkeypatch):
++    monkeypatch.setattr(
++        executor,
++        "get_args",
++        lambda: SimpleNamespace(
++            enable_external_expert_placement=False,
++            enable_expert_placement=False,
++        ),
++    )
++
++    result = executor.set_expert_placement([], SimpleNamespace(), {}, 1)
++
++    assert result["success"] is False
++    assert "--enable-external-expert-placement" in result["message"]
+diff --git a/tests_extend/unit_tests/mindspeed/core/transformer/moe/test_grouped_matmul_util.py b/tests_extend/unit_tests/mindspeed/core/transformer/moe/test_grouped_matmul_util.py
+new file mode 100644
+index 00000000..227b4a40
+--- /dev/null
++++ b/tests_extend/unit_tests/mindspeed/core/transformer/moe/test_grouped_matmul_util.py
+@@ -0,0 +1,9 @@
++from types import SimpleNamespace
++
++from mindspeed.core.transformer.moe import grouped_matmul_util
++
++
++def test_get_gmm_quant_func_treats_missing_fp8_flags_as_disabled(monkeypatch):
++    monkeypatch.setattr(grouped_matmul_util, "get_args", lambda: SimpleNamespace())
++
++    assert grouped_matmul_util.get_gmm_quant_func() is None
