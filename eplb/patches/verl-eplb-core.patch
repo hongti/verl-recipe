@@ -700,10 +700,10 @@ index bf379b49..65127834 100644
  
          log_gpu_memory_usage("After update_weights", logger=logger)
 diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
-index a8045f31..eb757029 100644
+index a8045f31..e82efb68 100644
 --- a/verl/workers/rollout/vllm_rollout/utils.py
 +++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -16,6 +16,7 @@ import json
+@@ -16,6 +16,7 @@
  import logging
  import os
  import platform
@@ -711,7 +711,7 @@ index a8045f31..eb757029 100644
  import signal
  import threading
  from collections.abc import Mapping
-@@ -35,6 +36,12 @@ from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_u
+@@ -35,12 +36,158 @@
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
@@ -724,10 +724,11 @@ index a8045f31..eb757029 100644
  # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
  VLLM_LORA_INT_ID = 123
  VLLM_LORA_NAME = "123"
-@@ -43,6 +50,146 @@ VLLM_LORA_PATH = "simon_lora_path"
+ VLLM_LORA_PATH = "simon_lora_path"
+
  VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
- 
- 
++
++
 +def _eplb_layer_id_from_weight_name(name: str) -> Optional[int]:
 +    if re.search(r"\.mlp\.experts\.\d+\.", name):
 +        return None
@@ -866,12 +867,93 @@ index a8045f31..eb757029 100644
 +        reordered.append((new_name, new_tensor))
 +
 +    return reordered
-+
-+
+
+
  def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
-     worker_local_rank = int(worker_local_rank)
-     if parallel_config is None:
-@@ -226,7 +373,13 @@ class vLLMColocateWorkerExtension:
+@@ -184,7 +331,82 @@
+         instance = super().__new__(cls)
+         instance._is_qat_model = _is_qat_model
+         instance._is_modelopt_qat = _is_modelopt_qat
++
++        # Read the initialization flag forwarded through vLLM config.
++        additional_config = getattr(vllm_config, "additional_config", None) or {}
++        instance._eplb_init_map = bool(additional_config.get("eplb_init_map", False))
++
++        if instance._eplb_init_map:
++            # Keep the original bound method of this worker instance.
++            original_load_model = instance.load_model
++
++            def load_model_with_eplb(*args, **kwargs):
++                """Initialize routing buffers after loading, before capture."""
++                result = original_load_model(*args, **kwargs)
++                instance._init_eplb_buffers()
++                return result
++
++            # Wrap this instance only; do not modify the worker class.
++            instance.load_model = load_model_with_eplb
++
+         return instance
++
++    def _init_eplb_buffers(self):
++        """Create identity routing buffers before warmup and graph capture."""
++        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
++
++        for layer in self.model_runner.model.modules():
++            if not isinstance(layer, AscendFusedMoE):
++                continue
++
++            config = layer.moe_config
++            num_experts = int(config.num_experts)
++            ep_size = int(config.ep_size)
++            ep_rank = int(config.ep_rank)
++
++            # This implementation keeps expert capacity and graph shapes fixed.
++            if (
++                ep_size <= 1
++                or num_experts % ep_size != 0
++                or layer.global_redundant_expert_num != 0
++            ):
++                raise ValueError(
++                    "EPLB buffer initialization requires fixed, equal "
++                    "expert capacity with no redundant experts."
++                )
++
++            # Avoid overwriting a map initialized by vLLM EPLB mechanism.
++            if layer.log2phy is not None:
++                raise RuntimeError(
++                    "log2phy already exists; do not combine eplb_init_map "
++                    "with native Ascend EPLB initialization."
++                )
++
++            # Identity routing is correct only for the default contiguous layout.
++            local_count = num_experts // ep_size
++            expected = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
++            start = ep_rank * local_count
++            expected[start : start + local_count] = torch.arange(local_count, dtype=torch.int32, device="cpu")
++
++            if (
++                not torch.is_tensor(layer._expert_map)
++                or not torch.equal(
++                    layer._expert_map.detach().cpu(), expected
++                )
++            ):
++                raise RuntimeError(
++                    "Initial expert layout is not contiguous; "
++                    "identity log2phy would be incorrect."
++                )
++
++            # A non-None map makes the first captured forward include Index.
++            mapping = torch.arange(num_experts, dtype=torch.int32, device=self.device)
++
++            # Register the map for existing buffer save/restore handling.
++            # Keep this tensor alive and update its contents in place later.
++            del layer.log2phy
++            layer.register_buffer("log2phy", mapping, persistent=False)
++
+
+     def _get_drafter_model(self):
+         """Return the drafter's model object, or None if unavailable."""
+@@ -226,7 +448,13 @@
              # patch weight loader to support MoE model
              patch_vllm_moe_model_weight_loader(model)
  
@@ -897,7 +979,7 @@ index a8045f31..eb757029 100644
          receiver = BucketedWeightReceiver(
              zmq_handle=self._get_zmq_handle(),
              device=self.device,
-@@ -268,7 +425,7 @@ class vLLMColocateWorkerExtension:
+@@ -268,7 +500,7 @@
          )
          receiver.receive_weights(
              on_bucket_received=lambda weights: self._update_weights(
@@ -905,18 +987,18 @@ index a8045f31..eb757029 100644
 +                weights, peft_config=peft_config, base_sync_done=base_sync_done, eplb_strategy=eplb_strategy
              )
          )
- 
-@@ -291,6 +448,9 @@ class vLLMColocateWorkerExtension:
+
+@@ -290,6 +522,9 @@
+
              for model, model_config in self._iter_all_models_with_config():
                  process_weights_after_loading(model, model_config, self.device)
- 
++
 +        if isinstance(eplb_strategy, dict):
 +            self._update_expert_map(eplb_strategy)
-+
+
      def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
          """Apply buffer updates to the main model and any synced MTP drafter.
- 
-@@ -303,7 +463,13 @@ class vLLMColocateWorkerExtension:
+@@ -303,7 +538,13 @@
              apply_buffer_updates(model, buffer_updates)
          return loaded
  
@@ -931,7 +1013,7 @@ index a8045f31..eb757029 100644
          if peft_config and base_sync_done:
              weights = dict(weights)
              lora_request = TensorLoRARequest(
-@@ -317,6 +483,7 @@ class vLLMColocateWorkerExtension:
+@@ -317,6 +558,7 @@
              logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
          else:
              param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
@@ -939,10 +1021,11 @@ index a8045f31..eb757029 100644
              # Add the FP8 related logic here as sharding manager has been deprecated.
              # Check if FP8 quantization is enabled and apply appropriate weight loading
              if is_fp8_model(self.model_runner.vllm_config):
-@@ -340,6 +507,57 @@ class vLLMColocateWorkerExtension:
+@@ -339,6 +581,74 @@
+                     f"Loading standard weights (non-FP8, async), "
                      f"loaded_params: {len(param_updates)}, loaded_buffers: {loaded_buffers}"
                  )
- 
++
 +    def _get_model_layers(self):
 +        model = self.model_runner.model
 +        if hasattr(model, "language_model"):
@@ -978,22 +1061,38 @@ index a8045f31..eb757029 100644
 +                global_expert_map[rank_id, local_experts] = torch.arange(len(local_experts), dtype=torch.int32)
 +
 +            expected_log2phy = generate_log2phy_map(global_expert_map, config.ep_rank)
-+            local_expert_map = global_expert_map[config.ep_rank].clone()
-+            actual_expert_map = getattr(fused_moe, "_expert_map", None)
-+            if torch.is_tensor(actual_expert_map):
-+                local_expert_map = local_expert_map.to(device=actual_expert_map.device)
-+            if hasattr(fused_moe, "update_expert_map"):
-+                fused_moe.update_expert_map(local_expert_map)
-+            else:
-+                fused_moe._expert_map = local_expert_map
++            local_expert_map = global_expert_map[config.ep_rank]
++            actual_expert_map = fused_moe._expert_map
++            actual_log2phy = fused_moe.log2phy
++
++            if actual_expert_map.shape != local_expert_map.shape:
++                raise ValueError("EPLB expert_map shape must remain fixed.")
++            if actual_log2phy is None:
++                if getattr(self, "_eplb_init_map", False):
++                    raise RuntimeError("log2phy was not initialized before graph capture.")
++            elif actual_log2phy.shape != expected_log2phy.shape:
++                raise ValueError("EPLB log2phy shape must remain fixed.")
++
++            with torch.no_grad():
++                # Preserve the existing expert-map buffer instead of replacing it.
++                actual_expert_map.copy_(
++                    local_expert_map.to(device=actual_expert_map.device, dtype=actual_expert_map.dtype)
++                )
++
++                if actual_log2phy is None:
++                    # Preserve the original lazy initialization for eager runs.
++                    fused_moe.log2phy = expected_log2phy.npu()
++                else:
++                    # Preserve the mapping address referenced by the captured graph.
++                    actual_log2phy.copy_(
++                        expected_log2phy.to(device=actual_log2phy.device, dtype=actual_log2phy.dtype)
++                    )
 +
 +            fused_moe.global_expert_map = global_expert_map
-+            actual_log2phy = getattr(fused_moe, "log2phy", None)
-+            if torch.is_tensor(actual_log2phy):
-+                fused_moe.log2phy = expected_log2phy.to(device=actual_log2phy.device)
-+            else:
-+                fused_moe.log2phy = expected_log2phy.npu()
 +
++        if getattr(self, "_eplb_init_map", False):
++            # Finish device writes before the update RPC returns.
++            torch.npu.synchronize()
+
      def _get_zmq_handle(self) -> str:
          """Get ZMQ handle for communication.
-         Uses Ray job id + replica_rank + rollout-local rank to match the sender

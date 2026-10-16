@@ -17,7 +17,7 @@ RECIPE_FOLDER=eplb
 # Patches shipped with this recipe (base commit -> sha256 of the patch file):
 #   verl         5a38699c0fbd99a249098b1d579817c8a8cfb8cd
 #                patches/verl-eplb-core.patch
-#                2d1e9bfd14810ac80bde437cbfa3641fcf8cbe29d69795ff05b95713d17a34db
+#                fb8a430fa1dda2bde65b7fad896159475adec930b7cdcfd417a5bb8f7f39d0ef
 #   MindSpeed    96e402f06994448fc86630dd658627ca5ebaee03   (gitcode.com/Ascend/MindSpeed)
 #                patches/mindspeed-eplb.patch
 #                98da192a3b7913c5850c19e6f3807ac158f555bb77d4188318bbf06ad8257de8
